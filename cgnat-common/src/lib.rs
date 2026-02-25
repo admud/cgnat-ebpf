@@ -83,6 +83,44 @@ pub enum TcpState {
     Closed = 10,
 }
 
+/// Port allocation state (for atomic port counter)
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PortAllocState {
+    /// Next port to try (wraps around within port_min..port_max)
+    pub next_port: u32,
+    /// Number of ports currently allocated
+    pub allocated_count: u32,
+    /// Number of allocation failures (port exhaustion)
+    pub alloc_failures: u64,
+    /// Number of successful allocations
+    pub alloc_success: u64,
+}
+
+/// Statistics counters
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NatStats {
+    /// Total packets processed
+    pub packets_total: u64,
+    /// Packets that matched NAT bindings
+    pub packets_nat_hit: u64,
+    /// Packets that missed (no binding)
+    pub packets_nat_miss: u64,
+    /// Outbound packets (SNAT)
+    pub packets_outbound: u64,
+    /// Inbound packets (DNAT)
+    pub packets_inbound: u64,
+    /// Hairpin packets
+    pub packets_hairpin: u64,
+    /// Dropped packets
+    pub packets_dropped: u64,
+    /// ICMP packets processed
+    pub packets_icmp: u64,
+    /// Bytes processed (total)
+    pub bytes_total: u64,
+}
+
 /// Configuration passed to eBPF program
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -136,3 +174,7 @@ unsafe impl aya::Pod for NatReverseKey {}
 unsafe impl aya::Pod for ConnState {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for NatConfig {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for PortAllocState {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for NatStats {}

@@ -5,43 +5,64 @@
 use anyhow::{Context, Result};
 use aya::{
     include_bytes_aligned,
-    maps::{Array, DevMap, HashMap},
+    maps::{Array, DevMap, PerCpuArray},
     programs::{Xdp, XdpFlags},
     Ebpf,
 };
 use aya_log::EbpfLogger;
-use cgnat_common::{NatBindingKey, NatBindingValue, NatConfig, NatReverseKey};
-use clap::Parser;
+use cgnat_common::{NatConfig, NatStats, PortAllocState};
+use clap::{Parser, Subcommand};
 use log::{info, warn};
 use std::net::Ipv4Addr;
+use std::time::Duration;
 use tokio::signal;
+use tokio::time::interval;
 
 #[derive(Debug, Parser)]
 #[command(name = "cgnat", about = "eBPF/XDP CGNAT implementation")]
 struct Args {
-    /// External interface name (e.g., eth0)
-    #[arg(short = 'e', long)]
-    external_iface: String,
+    #[command(subcommand)]
+    command: Commands,
+}
 
-    /// Internal interface name (e.g., eth1)
-    #[arg(short = 'i', long)]
-    internal_iface: String,
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Run the CGNAT daemon
+    Run {
+        /// External interface name (e.g., eth0)
+        #[arg(short = 'e', long)]
+        external_iface: String,
 
-    /// External (public) IP address
-    #[arg(short = 'E', long)]
-    external_addr: Ipv4Addr,
+        /// Internal interface name (e.g., eth1)
+        #[arg(short = 'i', long)]
+        internal_iface: String,
 
-    /// Internal subnet in CIDR notation (e.g., 10.0.0.0/8)
-    #[arg(short = 'I', long)]
-    internal_subnet: String,
+        /// External (public) IP address
+        #[arg(short = 'E', long)]
+        external_addr: Ipv4Addr,
 
-    /// Minimum port for NAT allocation (default: 1024)
-    #[arg(long, default_value = "1024")]
-    port_min: u16,
+        /// Internal subnet in CIDR notation (e.g., 10.0.0.0/8)
+        #[arg(short = 'I', long)]
+        internal_subnet: String,
 
-    /// Maximum port for NAT allocation (default: 65535)
-    #[arg(long, default_value = "65535")]
-    port_max: u16,
+        /// Minimum port for NAT allocation (default: 1024)
+        #[arg(long, default_value = "1024")]
+        port_min: u16,
+
+        /// Maximum port for NAT allocation (default: 65535)
+        #[arg(long, default_value = "65535")]
+        port_max: u16,
+
+        /// Print statistics every N seconds (0 to disable)
+        #[arg(long, default_value = "5")]
+        stats_interval: u64,
+
+        /// Use SKB mode instead of driver mode (more compatible but slower)
+        #[arg(long)]
+        skb_mode: bool,
+    },
+    /// Show current statistics
+    Stats,
 }
 
 #[tokio::main]
@@ -49,14 +70,56 @@ async fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
 
+    match args.command {
+        Commands::Run {
+            external_iface,
+            internal_iface,
+            external_addr,
+            internal_subnet,
+            port_min,
+            port_max,
+            stats_interval,
+            skb_mode,
+        } => {
+            run_cgnat(
+                external_iface,
+                internal_iface,
+                external_addr,
+                internal_subnet,
+                port_min,
+                port_max,
+                stats_interval,
+                skb_mode,
+            )
+            .await
+        }
+        Commands::Stats => {
+            println!("Stats command not implemented in standalone mode");
+            println!("Use 'run' command with --stats-interval to see live stats");
+            Ok(())
+        }
+    }
+}
+
+async fn run_cgnat(
+    external_iface: String,
+    internal_iface: String,
+    external_addr: Ipv4Addr,
+    internal_subnet: String,
+    port_min: u16,
+    port_max: u16,
+    stats_interval: u64,
+    skb_mode: bool,
+) -> Result<()> {
     // Parse internal subnet
-    let (subnet_addr, subnet_mask) = parse_cidr(&args.internal_subnet)?;
+    let (subnet_addr, subnet_mask) = parse_cidr(&internal_subnet)?;
 
     info!("Starting CGNAT");
-    info!("  External interface: {}", args.external_iface);
-    info!("  Internal interface: {}", args.internal_iface);
-    info!("  External address: {}", args.external_addr);
-    info!("  Internal subnet: {}", args.internal_subnet);
+    info!("  External interface: {}", external_iface);
+    info!("  Internal interface: {}", internal_iface);
+    info!("  External address: {}", external_addr);
+    info!("  Internal subnet: {}", internal_subnet);
+    info!("  Port range: {}-{}", port_min, port_max);
 
     // Load eBPF program
     #[cfg(debug_assertions)]
@@ -74,24 +137,43 @@ async fn main() -> Result<()> {
     }
 
     // Get interface indices
-    let external_ifindex = get_ifindex(&args.external_iface)?;
-    let internal_ifindex = get_ifindex(&args.internal_iface)?;
+    let external_ifindex = get_ifindex(&external_iface)?;
+    let internal_ifindex = get_ifindex(&internal_iface)?;
+
+    info!(
+        "Interface indices: external={}, internal={}",
+        external_ifindex, internal_ifindex
+    );
 
     // Configure the program
     let config = NatConfig {
-        external_addr: u32::from(args.external_addr),
+        external_addr: u32::from(external_addr),
         internal_subnet: u32::from(subnet_addr),
         internal_mask: subnet_mask,
         external_ifindex,
         internal_ifindex,
-        port_min: args.port_min,
-        port_max: args.port_max,
+        port_min,
+        port_max,
         ..Default::default()
     };
 
     // Write config to map
     let mut config_map: Array<_, NatConfig> = Array::try_from(bpf.map_mut("CONFIG").unwrap())?;
     config_map.set(0, config, 0)?;
+
+    // Initialize port allocation state
+    let mut port_alloc: Array<_, PortAllocState> =
+        Array::try_from(bpf.map_mut("PORT_ALLOC").unwrap())?;
+    port_alloc.set(
+        0,
+        PortAllocState {
+            next_port: 0,
+            allocated_count: 0,
+            alloc_failures: 0,
+            alloc_success: 0,
+        },
+        0,
+    )?;
 
     // Set up device map for XDP_REDIRECT
     let mut devmap: DevMap<_> = DevMap::try_from(bpf.map_mut("DEVMAP").unwrap())?;
@@ -102,22 +184,133 @@ async fn main() -> Result<()> {
     let program: &mut Xdp = bpf.program_mut("cgnat_xdp").unwrap().try_into()?;
     program.load()?;
 
-    // Use SKB mode for compatibility, can switch to DRV mode for performance
-    program.attach(&args.external_iface, XdpFlags::SKB_MODE)
-        .context("Failed to attach to external interface")?;
-    info!("Attached XDP to external interface: {}", args.external_iface);
+    let xdp_flags = if skb_mode {
+        info!("Using SKB mode (generic XDP)");
+        XdpFlags::SKB_MODE
+    } else {
+        info!("Using driver mode (native XDP)");
+        XdpFlags::default()
+    };
 
-    program.attach(&args.internal_iface, XdpFlags::SKB_MODE)
-        .context("Failed to attach to internal interface")?;
-    info!("Attached XDP to internal interface: {}", args.internal_iface);
+    // Try to attach, fall back to SKB mode if driver mode fails
+    match program.attach(&external_iface, xdp_flags) {
+        Ok(_) => info!("Attached XDP to external interface: {}", external_iface),
+        Err(e) if !skb_mode => {
+            warn!("Driver mode failed ({}), falling back to SKB mode", e);
+            program
+                .attach(&external_iface, XdpFlags::SKB_MODE)
+                .context("Failed to attach to external interface")?;
+            info!(
+                "Attached XDP (SKB mode) to external interface: {}",
+                external_iface
+            );
+        }
+        Err(e) => return Err(e).context("Failed to attach to external interface"),
+    }
+
+    match program.attach(&internal_iface, xdp_flags) {
+        Ok(_) => info!("Attached XDP to internal interface: {}", internal_iface),
+        Err(e) if !skb_mode => {
+            warn!("Driver mode failed ({}), falling back to SKB mode", e);
+            program
+                .attach(&internal_iface, XdpFlags::SKB_MODE)
+                .context("Failed to attach to internal interface")?;
+            info!(
+                "Attached XDP (SKB mode) to internal interface: {}",
+                internal_iface
+            );
+        }
+        Err(e) => return Err(e).context("Failed to attach to internal interface"),
+    }
 
     info!("CGNAT running. Press Ctrl+C to exit.");
+
+    // Start stats printing task if enabled
+    if stats_interval > 0 {
+        let stats_map: PerCpuArray<_, NatStats> =
+            PerCpuArray::try_from(bpf.map("STATS").unwrap())?;
+        let port_alloc_map: Array<_, PortAllocState> =
+            Array::try_from(bpf.map("PORT_ALLOC").unwrap())?;
+
+        tokio::spawn(async move {
+            print_stats_loop(stats_map, port_alloc_map, stats_interval).await;
+        });
+    }
 
     // Wait for shutdown signal
     signal::ctrl_c().await?;
 
     info!("Shutting down...");
     Ok(())
+}
+
+/// Print statistics periodically
+async fn print_stats_loop(
+    stats_map: PerCpuArray<&aya::maps::MapData, NatStats>,
+    port_alloc_map: Array<&aya::maps::MapData, PortAllocState>,
+    interval_secs: u64,
+) {
+    let mut ticker = interval(Duration::from_secs(interval_secs));
+    let mut last_stats = NatStats::default();
+
+    loop {
+        ticker.tick().await;
+
+        // Aggregate per-CPU stats
+        let mut total = NatStats::default();
+        if let Ok(per_cpu_values) = stats_map.get(&0, 0) {
+            for cpu_stats in per_cpu_values.iter() {
+                total.packets_total += cpu_stats.packets_total;
+                total.packets_nat_hit += cpu_stats.packets_nat_hit;
+                total.packets_nat_miss += cpu_stats.packets_nat_miss;
+                total.packets_outbound += cpu_stats.packets_outbound;
+                total.packets_inbound += cpu_stats.packets_inbound;
+                total.packets_hairpin += cpu_stats.packets_hairpin;
+                total.packets_dropped += cpu_stats.packets_dropped;
+                total.packets_icmp += cpu_stats.packets_icmp;
+                total.bytes_total += cpu_stats.bytes_total;
+            }
+        }
+
+        // Get port allocation stats
+        let port_alloc = port_alloc_map.get(&0, 0).unwrap_or_default();
+
+        // Calculate rates
+        let pps = (total.packets_total - last_stats.packets_total) / interval_secs;
+        let bps = (total.bytes_total - last_stats.bytes_total) * 8 / interval_secs;
+
+        println!("\n=== CGNAT Statistics ===");
+        println!(
+            "Packets: {} total ({} pps), {} bytes ({} bps)",
+            total.packets_total, pps, total.bytes_total, bps
+        );
+        println!(
+            "NAT: {} hits, {} misses ({:.1}% hit rate)",
+            total.packets_nat_hit,
+            total.packets_nat_miss,
+            if total.packets_nat_hit + total.packets_nat_miss > 0 {
+                total.packets_nat_hit as f64
+                    / (total.packets_nat_hit + total.packets_nat_miss) as f64
+                    * 100.0
+            } else {
+                0.0
+            }
+        );
+        println!(
+            "Direction: {} outbound, {} inbound, {} hairpin",
+            total.packets_outbound, total.packets_inbound, total.packets_hairpin
+        );
+        println!(
+            "ICMP: {}, Dropped: {}",
+            total.packets_icmp, total.packets_dropped
+        );
+        println!(
+            "Ports: {} allocated, {} success, {} failures",
+            port_alloc.allocated_count, port_alloc.alloc_success, port_alloc.alloc_failures
+        );
+
+        last_stats = total;
+    }
 }
 
 /// Parse CIDR notation (e.g., "10.0.0.0/8") into address and mask
@@ -148,4 +341,31 @@ fn get_ifindex(name: &str) -> Result<u32> {
     let index = nix::net::if_::if_nametoindex(name)
         .with_context(|| format!("Failed to get index for interface: {}", name))?;
     Ok(index)
+}
+
+impl Default for PortAllocState {
+    fn default() -> Self {
+        Self {
+            next_port: 0,
+            allocated_count: 0,
+            alloc_failures: 0,
+            alloc_success: 0,
+        }
+    }
+}
+
+impl Default for NatStats {
+    fn default() -> Self {
+        Self {
+            packets_total: 0,
+            packets_nat_hit: 0,
+            packets_nat_miss: 0,
+            packets_outbound: 0,
+            packets_inbound: 0,
+            packets_hairpin: 0,
+            packets_dropped: 0,
+            packets_icmp: 0,
+            bytes_total: 0,
+        }
+    }
 }

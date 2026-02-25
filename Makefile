@@ -51,4 +51,43 @@ run: build
 
 # Example usage
 example:
-	@echo "Example: make run ARGS='-e eth0 -i eth1 -E 203.0.113.1 -I 10.0.0.0/8'"
+	@echo "Example: make run ARGS='run -e eth0 -i eth1 -E 203.0.113.1 -I 10.0.0.0/8'"
+
+# ============================================================================
+# Testing
+# ============================================================================
+
+# Set up test environment (requires root)
+test-setup:
+	sudo ./tests/setup_test_env.sh setup
+
+# Clean up test environment (requires root)
+test-cleanup:
+	sudo ./tests/setup_test_env.sh cleanup
+
+# Show test environment status
+test-status:
+	sudo ./tests/setup_test_env.sh status
+
+# Run integration tests (requires test environment and CGNAT running)
+test-integration:
+	sudo ./tests/run_tests.sh all
+
+# Run CGNAT in test environment
+test-run: build
+	@echo "Starting CGNAT in test namespace..."
+	@echo "Press Ctrl+C to stop"
+	sudo ip netns exec ns_cgnat ./target/release/cgnat run \
+		-e veth_ext_a -i br_int -E 203.0.113.1 -I 10.0.0.0/24 --skb-mode
+
+# Full test cycle
+test: build test-setup
+	@echo ""
+	@echo "Test environment ready. In another terminal, run:"
+	@echo "  make test-run"
+	@echo ""
+	@echo "Then in a third terminal, run:"
+	@echo "  make test-integration"
+	@echo ""
+	@echo "When done, run:"
+	@echo "  make test-cleanup"
