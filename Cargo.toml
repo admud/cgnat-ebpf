@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["cgnat-common", "cgnat-ebpf", "cgnat"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/admud/cgnat-ebpf"
+
+[workspace.dependencies]
+aya = "0.13"
+aya-ebpf = "0.1"
+aya-log = "0.2"
+aya-log-ebpf = "0.1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"
+tokio = { version = "1", features = ["full"] }

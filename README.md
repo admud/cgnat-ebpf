@@ -124,34 +124,82 @@ Implement stateful connection tracking entirely in eBPF maps:
 - [ ] Logging and metrics export
 - [ ] Configuration interface
 
+## Project Structure
+
+```
+cgnat-ebpf/
+├── cgnat-common/     # Shared types between userspace and eBPF
+├── cgnat-ebpf/       # XDP eBPF program (compiled to BPF bytecode)
+├── cgnat/            # Userspace loader and CLI
+├── Makefile          # Build automation
+└── README.md
+```
+
 ## Development
 
 ### Prerequisites
 
 - Linux kernel 5.15+ (for BPF features)
-- clang/llvm 14+
-- libbpf
-- Rust toolchain (or C++ - TBD)
+- Rust nightly toolchain
+- bpf-linker
+- clang/llvm (for BPF compilation)
+
+### Setup
+
+```bash
+# Install Rust nightly and dependencies
+make deps
+
+# Or manually:
+rustup install nightly
+rustup component add rust-src --toolchain nightly
+cargo install bpf-linker
+```
 
 ### Building
 
 ```bash
-# TBD
+# Build everything (eBPF + userspace)
+make build
+
+# Debug build
+make debug
+
+# Build only eBPF program
+make build-ebpf
+
+# Build only userspace
+make build-user
+```
+
+### Running
+
+```bash
+# Run with sudo (XDP requires CAP_NET_ADMIN)
+sudo ./target/release/cgnat \
+    -e eth0 \              # External interface
+    -i eth1 \              # Internal interface
+    -E 203.0.113.1 \       # External (public) IP
+    -I 10.0.0.0/8          # Internal subnet
+
+# Or use make
+make run ARGS="-e eth0 -i eth1 -E 203.0.113.1 -I 10.0.0.0/8"
 ```
 
 ### Testing
 
 ```bash
-# TBD - Will use network namespaces for isolated testing
+# TODO: Network namespace based tests
+# Will create isolated test environments with veth pairs
 ```
 
 ## References
 
 - [einat-ebpf](https://github.com/EHfive/einat-ebpf) - Reference implementation (limitations documented above)
 - [einat-ebpf Issue #4](https://github.com/EHfive/einat-ebpf/issues/4) - Hairpinning routing problem
+- [Aya](https://aya-rs.dev/) - Rust eBPF framework
 - [XDP Tutorial](https://github.com/xdp-project/xdp-tutorial) - Learning XDP
-- [libbpf-bootstrap](https://github.com/libbpf/libbpf-bootstrap) - Modern BPF development
 
 ## License
 
-TBD
+MIT OR Apache-2.0
