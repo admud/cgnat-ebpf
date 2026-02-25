@@ -122,13 +122,14 @@ async fn run_cgnat(
     info!("  Port range: {}-{}", port_min, port_max);
 
     // Load eBPF program
+    // Load eBPF bytecode (built separately in cgnat-ebpf crate)
     #[cfg(debug_assertions)]
     let mut bpf = Ebpf::load(include_bytes_aligned!(
-        "../../target/bpfel-unknown-none/debug/cgnat-ebpf"
+        "../../cgnat-ebpf/target/bpfel-unknown-none/debug/cgnat-ebpf"
     ))?;
     #[cfg(not(debug_assertions))]
     let mut bpf = Ebpf::load(include_bytes_aligned!(
-        "../../target/bpfel-unknown-none/release/cgnat-ebpf"
+        "../../cgnat-ebpf/target/bpfel-unknown-none/release/cgnat-ebpf"
     ))?;
 
     // Set up logging
@@ -225,92 +226,99 @@ async fn run_cgnat(
 
     info!("CGNAT running. Press Ctrl+C to exit.");
 
-    // Start stats printing task if enabled
-    if stats_interval > 0 {
-        let stats_map: PerCpuArray<_, NatStats> =
-            PerCpuArray::try_from(bpf.map("STATS").unwrap())?;
-        let port_alloc_map: Array<_, PortAllocState> =
-            Array::try_from(bpf.map("PORT_ALLOC").unwrap())?;
-
-        tokio::spawn(async move {
-            print_stats_loop(stats_map, port_alloc_map, stats_interval).await;
-        });
-    }
-
-    // Wait for shutdown signal
-    signal::ctrl_c().await?;
-
-    info!("Shutting down...");
-    Ok(())
-}
-
-/// Print statistics periodically
-async fn print_stats_loop(
-    stats_map: PerCpuArray<&aya::maps::MapData, NatStats>,
-    port_alloc_map: Array<&aya::maps::MapData, PortAllocState>,
-    interval_secs: u64,
-) {
-    let mut ticker = interval(Duration::from_secs(interval_secs));
+    // Main loop with stats printing
+    let mut stats_ticker = interval(Duration::from_secs(stats_interval.max(1)));
     let mut last_stats = NatStats::default();
 
     loop {
-        ticker.tick().await;
-
-        // Aggregate per-CPU stats
-        let mut total = NatStats::default();
-        if let Ok(per_cpu_values) = stats_map.get(&0, 0) {
-            for cpu_stats in per_cpu_values.iter() {
-                total.packets_total += cpu_stats.packets_total;
-                total.packets_nat_hit += cpu_stats.packets_nat_hit;
-                total.packets_nat_miss += cpu_stats.packets_nat_miss;
-                total.packets_outbound += cpu_stats.packets_outbound;
-                total.packets_inbound += cpu_stats.packets_inbound;
-                total.packets_hairpin += cpu_stats.packets_hairpin;
-                total.packets_dropped += cpu_stats.packets_dropped;
-                total.packets_icmp += cpu_stats.packets_icmp;
-                total.bytes_total += cpu_stats.bytes_total;
+        tokio::select! {
+            _ = signal::ctrl_c() => {
+                info!("Shutting down...");
+                break;
+            }
+            _ = stats_ticker.tick(), if stats_interval > 0 => {
+                // Get stats
+                if let Ok(stats_map) = PerCpuArray::<_, NatStats>::try_from(bpf.map("STATS").unwrap()) {
+                    if let Ok(port_alloc_map) = Array::<_, PortAllocState>::try_from(bpf.map("PORT_ALLOC").unwrap()) {
+                        print_stats(&stats_map, &port_alloc_map, stats_interval, &mut last_stats);
+                    }
+                }
             }
         }
-
-        // Get port allocation stats
-        let port_alloc = port_alloc_map.get(&0, 0).unwrap_or_default();
-
-        // Calculate rates
-        let pps = (total.packets_total - last_stats.packets_total) / interval_secs;
-        let bps = (total.bytes_total - last_stats.bytes_total) * 8 / interval_secs;
-
-        println!("\n=== CGNAT Statistics ===");
-        println!(
-            "Packets: {} total ({} pps), {} bytes ({} bps)",
-            total.packets_total, pps, total.bytes_total, bps
-        );
-        println!(
-            "NAT: {} hits, {} misses ({:.1}% hit rate)",
-            total.packets_nat_hit,
-            total.packets_nat_miss,
-            if total.packets_nat_hit + total.packets_nat_miss > 0 {
-                total.packets_nat_hit as f64
-                    / (total.packets_nat_hit + total.packets_nat_miss) as f64
-                    * 100.0
-            } else {
-                0.0
-            }
-        );
-        println!(
-            "Direction: {} outbound, {} inbound, {} hairpin",
-            total.packets_outbound, total.packets_inbound, total.packets_hairpin
-        );
-        println!(
-            "ICMP: {}, Dropped: {}",
-            total.packets_icmp, total.packets_dropped
-        );
-        println!(
-            "Ports: {} allocated, {} success, {} failures",
-            port_alloc.allocated_count, port_alloc.alloc_success, port_alloc.alloc_failures
-        );
-
-        last_stats = total;
     }
+
+    Ok(())
+}
+
+/// Print statistics once
+fn print_stats(
+    stats_map: &PerCpuArray<&aya::maps::MapData, NatStats>,
+    port_alloc_map: &Array<&aya::maps::MapData, PortAllocState>,
+    interval_secs: u64,
+    last_stats: &mut NatStats,
+) {
+    // Aggregate per-CPU stats
+    let mut total = NatStats::default();
+    if let Ok(per_cpu_values) = stats_map.get(&0, 0) {
+        for cpu_stats in per_cpu_values.iter() {
+            total.packets_total += cpu_stats.packets_total;
+            total.packets_nat_hit += cpu_stats.packets_nat_hit;
+            total.packets_nat_miss += cpu_stats.packets_nat_miss;
+            total.packets_outbound += cpu_stats.packets_outbound;
+            total.packets_inbound += cpu_stats.packets_inbound;
+            total.packets_hairpin += cpu_stats.packets_hairpin;
+            total.packets_dropped += cpu_stats.packets_dropped;
+            total.packets_icmp += cpu_stats.packets_icmp;
+            total.bytes_total += cpu_stats.bytes_total;
+        }
+    }
+
+    // Get port allocation stats
+    let port_alloc = port_alloc_map.get(&0, 0).unwrap_or_default();
+
+    // Calculate rates
+    let pps = if interval_secs > 0 {
+        (total.packets_total.saturating_sub(last_stats.packets_total)) / interval_secs
+    } else {
+        0
+    };
+    let bps = if interval_secs > 0 {
+        (total.bytes_total.saturating_sub(last_stats.bytes_total)) * 8 / interval_secs
+    } else {
+        0
+    };
+
+    println!("\n=== CGNAT Statistics ===");
+    println!(
+        "Packets: {} total ({} pps), {} bytes ({} bps)",
+        total.packets_total, pps, total.bytes_total, bps
+    );
+    println!(
+        "NAT: {} hits, {} misses ({:.1}% hit rate)",
+        total.packets_nat_hit,
+        total.packets_nat_miss,
+        if total.packets_nat_hit + total.packets_nat_miss > 0 {
+            total.packets_nat_hit as f64
+                / (total.packets_nat_hit + total.packets_nat_miss) as f64
+                * 100.0
+        } else {
+            0.0
+        }
+    );
+    println!(
+        "Direction: {} outbound, {} inbound, {} hairpin",
+        total.packets_outbound, total.packets_inbound, total.packets_hairpin
+    );
+    println!(
+        "ICMP: {}, Dropped: {}",
+        total.packets_icmp, total.packets_dropped
+    );
+    println!(
+        "Ports: {} allocated, {} success, {} failures",
+        port_alloc.allocated_count, port_alloc.alloc_success, port_alloc.alloc_failures
+    );
+
+    *last_stats = total;
 }
 
 /// Parse CIDR notation (e.g., "10.0.0.0/8") into address and mask
@@ -343,29 +351,3 @@ fn get_ifindex(name: &str) -> Result<u32> {
     Ok(index)
 }
 
-impl Default for PortAllocState {
-    fn default() -> Self {
-        Self {
-            next_port: 0,
-            allocated_count: 0,
-            alloc_failures: 0,
-            alloc_success: 0,
-        }
-    }
-}
-
-impl Default for NatStats {
-    fn default() -> Self {
-        Self {
-            packets_total: 0,
-            packets_nat_hit: 0,
-            packets_nat_miss: 0,
-            packets_outbound: 0,
-            packets_inbound: 0,
-            packets_hairpin: 0,
-            packets_dropped: 0,
-            packets_icmp: 0,
-            bytes_total: 0,
-        }
-    }
-}

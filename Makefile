@@ -25,6 +25,7 @@ debug-user: debug-ebpf
 # Clean build artifacts
 clean:
 	cargo clean
+	cd cgnat-ebpf && cargo clean
 
 # Run clippy
 lint:

@@ -1,5 +1,4 @@
 [build]
-target-dir = "../target"
 target = "bpfel-unknown-none"
 
 [unstable]

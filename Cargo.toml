@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["cgnat-common", "cgnat-ebpf", "cgnat"]
+members = ["cgnat-common", "cgnat"]
+exclude = ["cgnat-ebpf"]
+# Note: cgnat-ebpf is excluded from workspace as it requires different build config (eBPF target)
 
 [workspace.package]
 version = "0.1.0"

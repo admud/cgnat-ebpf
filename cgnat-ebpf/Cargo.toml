@@ -1,12 +1,12 @@
 [package]
 name = "cgnat-ebpf"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
-aya-ebpf = { workspace = true }
-aya-log-ebpf = { workspace = true }
+aya-ebpf = "0.1"
+aya-log-ebpf = "0.1"
 cgnat-common = { path = "../cgnat-common" }
 network-types = "0.0.7"
 
