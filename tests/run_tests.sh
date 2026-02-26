@@ -28,8 +28,8 @@ PASSED=0
 FAILED=0
 
 log_test() { echo -e "${YELLOW}[TEST]${NC} $1"; }
-log_pass() { echo -e "${GREEN}[PASS]${NC} $1"; ((PASSED++)); }
-log_fail() { echo -e "${RED}[FAIL]${NC} $1"; ((FAILED++)); }
+log_pass() { echo -e "${GREEN}[PASS]${NC} $1"; PASSED=$((PASSED + 1)); }
+log_fail() { echo -e "${RED}[FAIL]${NC} $1"; FAILED=$((FAILED + 1)); }
 
 # Check if running as root
 check_root() {
@@ -180,7 +180,7 @@ test_multiple_connections() {
     SUCCESS=0
     for port in 7001 7002 7003; do
         if grep -q "Test $port" /tmp/cgnat_test_multi_$port 2>/dev/null; then
-            ((SUCCESS++))
+            SUCCESS=$((SUCCESS + 1))
         fi
         rm -f /tmp/cgnat_test_multi_$port
     done
@@ -263,16 +263,36 @@ run_all_tests() {
 
     check_root
     check_env
-    # check_cgnat  # Uncomment when CGNAT is running
-    # wait_cgnat_ready
 
-    # Run tests that don't require CGNAT (baseline)
-    log_test "Running baseline tests (no CGNAT)..."
+    # Check if CGNAT is running
+    CGNAT_RUNNING=false
+    if pgrep -f "cgnat run" > /dev/null; then
+        CGNAT_RUNNING=true
+        log_test "CGNAT detected - running full tests"
+        wait_cgnat_ready
+    else
+        log_test "CGNAT not running - running baseline tests only"
+        echo "  To run full tests, start CGNAT first with:"
+        echo "    sudo ip netns exec $NS_CGNAT $PROJECT_DIR/target/release/cgnat run \\"
+        echo "      -e veth_ext_a -i br_int -E $EXTERNAL_IP -I 10.0.0.0/24 --skb-mode"
+        echo ""
+    fi
 
-    # These tests verify the test environment works
-    test_outbound_icmp || true
-    test_multiple_connections || true
-    test_different_internal_hosts || true
+    if [ "$CGNAT_RUNNING" = true ]; then
+        # Run full CGNAT tests
+        test_outbound_tcp || true
+        test_outbound_udp || true
+        test_outbound_icmp || true
+        test_inbound_tcp || true
+        test_multiple_connections || true
+        test_connection_reuse || true
+        test_different_internal_hosts || true
+    else
+        # Run baseline tests (verify test environment)
+        test_outbound_icmp || true
+        test_multiple_connections || true
+        test_different_internal_hosts || true
+    fi
 
     echo ""
     echo "========================================"

@@ -157,7 +157,7 @@ impl Default for NatConfig {
             internal_ifindex: 0,
             port_min: 1024,
             port_max: 65535,
-            udp_timeout: 300,           // 5 minutes
+            udp_timeout: 300,              // 5 minutes
             tcp_established_timeout: 7200, // 2 hours
             tcp_transitory_timeout: 240,   // 4 minutes
         }

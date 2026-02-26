@@ -101,6 +101,7 @@ async fn main() -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_cgnat(
     external_iface: String,
     internal_iface: String,
@@ -277,16 +278,17 @@ fn print_stats(
     let port_alloc = port_alloc_map.get(&0, 0).unwrap_or_default();
 
     // Calculate rates
-    let pps = if interval_secs > 0 {
-        (total.packets_total.saturating_sub(last_stats.packets_total)) / interval_secs
-    } else {
-        0
-    };
-    let bps = if interval_secs > 0 {
-        (total.bytes_total.saturating_sub(last_stats.bytes_total)) * 8 / interval_secs
-    } else {
-        0
-    };
+    let pps = total
+        .packets_total
+        .saturating_sub(last_stats.packets_total)
+        .checked_div(interval_secs)
+        .unwrap_or(0);
+    let bps = total
+        .bytes_total
+        .saturating_sub(last_stats.bytes_total)
+        .saturating_mul(8)
+        .checked_div(interval_secs)
+        .unwrap_or(0);
 
     println!("\n=== CGNAT Statistics ===");
     println!(
@@ -298,8 +300,7 @@ fn print_stats(
         total.packets_nat_hit,
         total.packets_nat_miss,
         if total.packets_nat_hit + total.packets_nat_miss > 0 {
-            total.packets_nat_hit as f64
-                / (total.packets_nat_hit + total.packets_nat_miss) as f64
+            total.packets_nat_hit as f64 / (total.packets_nat_hit + total.packets_nat_miss) as f64
                 * 100.0
         } else {
             0.0
@@ -350,4 +351,3 @@ fn get_ifindex(name: &str) -> Result<u32> {
         .with_context(|| format!("Failed to get index for interface: {}", name))?;
     Ok(index)
 }
-

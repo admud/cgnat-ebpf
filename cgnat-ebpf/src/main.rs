@@ -18,10 +18,10 @@ use aya_ebpf::{
     maps::{Array, DevMap, HashMap, PerCpuArray},
     programs::XdpContext,
 };
-use aya_log_ebpf::{debug, error, info};
+use aya_log_ebpf::debug;
 use cgnat_common::{
-    ConnState, NatBindingKey, NatBindingValue, NatConfig, NatReverseKey, NatStats,
-    PortAllocState, TcpState,
+    ConnState, NatBindingKey, NatBindingValue, NatConfig, NatReverseKey, NatStats, PortAllocState,
+    TcpState,
 };
 use core::mem;
 use network_types::{
@@ -43,8 +43,7 @@ static NAT_BINDINGS: HashMap<NatBindingKey, NatBindingValue> =
 
 /// Reverse NAT table: external addr:port -> internal addr:port
 #[map]
-static NAT_REVERSE: HashMap<NatReverseKey, NatBindingKey> =
-    HashMap::with_max_entries(1 << 20, 0);
+static NAT_REVERSE: HashMap<NatReverseKey, NatBindingKey> = HashMap::with_max_entries(1 << 20, 0);
 
 /// Connection state tracking
 #[map]
@@ -99,7 +98,7 @@ pub fn cgnat_xdp(ctx: XdpContext) -> u32 {
 
 #[inline(always)]
 fn try_cgnat_xdp(ctx: XdpContext) -> Result<u32, ()> {
-    let config = unsafe { CONFIG.get(0).ok_or(())? };
+    let config = CONFIG.get(0).ok_or(())?;
 
     // Update stats
     update_stats(|s| s.packets_total += 1);
@@ -182,12 +181,11 @@ fn handle_outbound_tcp(
     ctx: &XdpContext,
     ipv4hdr: *mut Ipv4Hdr,
     src_addr: u32,
-    dst_addr: u32,
+    _dst_addr: u32,
     config: &NatConfig,
 ) -> Result<u32, ()> {
     let tcphdr: *mut TcpHdr = ptr_at_mut(ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
     let src_port = u16::from_be(unsafe { (*tcphdr).source });
-    let dst_port = u16::from_be(unsafe { (*tcphdr).dest });
     let tcp_flags = get_tcp_flags(tcphdr);
 
     // Build NAT key
@@ -206,9 +204,7 @@ fn handle_outbound_tcp(
         }
         None => {
             update_stats(|s| s.packets_nat_miss += 1);
-            // Allocate new binding
-            let new_binding = allocate_binding(&key, config)?;
-            new_binding
+            allocate_binding(&key, config)?
         }
     };
 
@@ -236,7 +232,7 @@ fn handle_outbound_tcp(
         true, // is_tcp
     )?;
 
-    Ok(xdp_action::XDP_TX)
+    redirect_to_external(config)
 }
 
 #[inline(always)]
@@ -244,7 +240,7 @@ fn handle_outbound_udp(
     ctx: &XdpContext,
     ipv4hdr: *mut Ipv4Hdr,
     src_addr: u32,
-    dst_addr: u32,
+    _dst_addr: u32,
     config: &NatConfig,
 ) -> Result<u32, ()> {
     let udphdr: *mut UdpHdr = ptr_at_mut(ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
@@ -299,7 +295,7 @@ fn handle_outbound_udp(
         )?;
     }
 
-    Ok(xdp_action::XDP_TX)
+    redirect_to_external(config)
 }
 
 #[inline(always)]
@@ -330,7 +326,7 @@ fn handle_outbound_icmp(
             };
 
             // Rewrite source IP and ICMP ID
-            let old_src_addr = unsafe { (*ipv4hdr).src_addr };
+            let old_id = unsafe { (*icmphdr).un.echo.id };
             unsafe {
                 (*ipv4hdr).src_addr = binding.external_addr.to_be();
                 (*icmphdr).un.echo.id = binding.external_port.to_be();
@@ -338,9 +334,9 @@ fn handle_outbound_icmp(
 
             // Update checksums
             update_ip_checksum(ipv4hdr)?;
-            update_icmp_checksum(ctx, icmphdr)?;
+            update_icmp_checksum_incremental(icmphdr, old_id, binding.external_port.to_be())?;
 
-            Ok(xdp_action::XDP_TX)
+            redirect_to_external(config)
         }
         ICMP_DEST_UNREACHABLE | ICMP_TIME_EXCEEDED => {
             // ICMP error - need to translate embedded packet
@@ -527,13 +523,14 @@ fn handle_inbound_icmp(
             };
 
             // Rewrite destination IP and ICMP ID
+            let old_id = unsafe { (*icmphdr).un.echo.id };
             unsafe {
                 (*ipv4hdr).dst_addr = binding.internal_addr.to_be();
                 (*icmphdr).un.echo.id = binding.internal_port.to_be();
             }
 
             update_ip_checksum(ipv4hdr)?;
-            update_icmp_checksum(ctx, icmphdr)?;
+            update_icmp_checksum_incremental(icmphdr, old_id, binding.internal_port.to_be())?;
 
             redirect_to_internal(config)
         }
@@ -631,7 +628,17 @@ fn handle_hairpin(
                 (*tcphdr).source = src_binding.external_port.to_be();
                 (*tcphdr).dest = dst_binding.internal_port.to_be();
             }
-            update_tcp_checksum_full(ctx, ipv4hdr, tcphdr)?;
+            update_tcp_checksum_hairpin(
+                tcphdr,
+                old_src_addr,
+                src_binding.external_addr.to_be(),
+                old_dst_addr,
+                dst_binding.internal_addr.to_be(),
+                old_src_port,
+                src_binding.external_port.to_be(),
+                old_dst_port,
+                dst_binding.internal_port.to_be(),
+            )?;
         }
         IpProto::Udp => {
             let udphdr: *mut UdpHdr = ptr_at_mut(ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
@@ -644,17 +651,21 @@ fn handle_hairpin(
         }
         IpProto::Icmp => {
             let icmphdr: *mut IcmpHdr = ptr_at_mut(ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
+            let old_id = unsafe { (*icmphdr).un.echo.id };
             unsafe {
                 (*icmphdr).un.echo.id = dst_binding.internal_port.to_be();
             }
-            update_icmp_checksum(ctx, icmphdr)?;
+            update_icmp_checksum_incremental(icmphdr, old_id, dst_binding.internal_port.to_be())?;
         }
         _ => {}
     }
 
     update_ip_checksum(ipv4hdr)?;
 
-    debug!(ctx, "Hairpin: {} -> {}", src_addr, dst_binding.internal_addr);
+    debug!(
+        ctx,
+        "Hairpin: {} -> {}", src_addr, dst_binding.internal_addr
+    );
 
     redirect_to_internal(config)
 }
@@ -726,24 +737,15 @@ fn handle_icmp_error_outbound(
         _ => {}
     }
 
-    // Rewrite outer source IP
-    let src_addr = u32::from_be(unsafe { (*ipv4hdr).src_addr });
-    let src_key = NatBindingKey {
-        internal_addr: src_addr,
-        internal_port: 0, // ICMP errors don't have a specific port
-        protocol: IpProto::Icmp as u8,
-        _pad: 0,
-    };
-
     // Use the same external address
     unsafe {
         (*ipv4hdr).src_addr = config.external_addr.to_be();
     }
 
     update_ip_checksum(ipv4hdr)?;
-    update_icmp_checksum(ctx, icmphdr)?;
+    update_icmp_checksum_error(ctx, icmphdr)?;
 
-    Ok(xdp_action::XDP_TX)
+    redirect_to_external(config)
 }
 
 /// Handle inbound ICMP errors - translate embedded packet
@@ -814,7 +816,7 @@ fn handle_icmp_error_inbound(
     }
 
     update_ip_checksum(ipv4hdr)?;
-    update_icmp_checksum(ctx, icmphdr)?;
+    update_icmp_checksum_error(ctx, icmphdr)?;
 
     redirect_to_internal(config)
 }
@@ -826,7 +828,7 @@ fn handle_icmp_error_inbound(
 /// Allocate a new NAT binding with an external port
 #[inline(always)]
 fn allocate_binding(key: &NatBindingKey, config: &NatConfig) -> Result<NatBindingValue, ()> {
-    let port_state = unsafe { PORT_ALLOC.get_ptr_mut(0).ok_or(())? };
+    let port_state = PORT_ALLOC.get_ptr_mut(0).ok_or(())?;
 
     let port_range = (config.port_max - config.port_min + 1) as u32;
     if port_range == 0 {
@@ -834,7 +836,7 @@ fn allocate_binding(key: &NatBindingKey, config: &NatConfig) -> Result<NatBindin
     }
 
     // Try to allocate a port
-    for attempt in 0..MAX_PORT_ALLOC_ATTEMPTS {
+    for _attempt in 0..MAX_PORT_ALLOC_ATTEMPTS {
         // Atomic increment of next_port
         let current = unsafe { core::ptr::read_volatile(&(*port_state).next_port) };
         let next = current.wrapping_add(1);
@@ -867,13 +869,13 @@ fn allocate_binding(key: &NatBindingKey, config: &NatConfig) -> Result<NatBindin
         };
 
         // Insert into both maps
-        if unsafe { NAT_BINDINGS.insert(key, &binding, 0).is_err() } {
+        if NAT_BINDINGS.insert(key, &binding, 0).is_err() {
             continue;
         }
 
-        if unsafe { NAT_REVERSE.insert(&reverse_key, key, 0).is_err() } {
+        if NAT_REVERSE.insert(&reverse_key, key, 0).is_err() {
             // Rollback the binding
-            let _ = unsafe { NAT_BINDINGS.remove(key) };
+            let _ = NAT_BINDINGS.remove(key);
             continue;
         }
 
@@ -888,7 +890,7 @@ fn allocate_binding(key: &NatBindingKey, config: &NatConfig) -> Result<NatBindin
             flags: 0,
             _pad: [0; 6],
         };
-        let _ = unsafe { CONN_TRACK.insert(key, &conn_state, 0) };
+        let _ = CONN_TRACK.insert(key, &conn_state, 0);
 
         // Update stats
         unsafe {
@@ -917,7 +919,7 @@ fn allocate_binding(key: &NatBindingKey, config: &NatConfig) -> Result<NatBindin
 /// Update TCP connection state based on flags
 #[inline(always)]
 fn update_conn_state(key: &NatBindingKey, tcp_flags: u8, is_outbound: bool) -> Result<(), ()> {
-    let state = unsafe { CONN_TRACK.get_ptr_mut(key).ok_or(())? };
+    let state = CONN_TRACK.get_ptr_mut(key).ok_or(())?;
 
     let now = unsafe { bpf_ktime_get_ns() };
     unsafe {
@@ -931,11 +933,18 @@ fn update_conn_state(key: &NatBindingKey, tcp_flags: u8, is_outbound: bool) -> R
 
     // TCP state machine
     let current_state = unsafe { (*state).tcp_state };
-    let new_state = match (current_state, tcp_flags & (TCP_SYN | TCP_ACK | TCP_FIN | TCP_RST)) {
+    let new_state = match (
+        current_state,
+        tcp_flags & (TCP_SYN | TCP_ACK | TCP_FIN | TCP_RST),
+    ) {
         // New connection
         (s, TCP_SYN) if s == TcpState::None as u8 && is_outbound => TcpState::SynSent as u8,
         // SYN-ACK received
-        (s, f) if s == TcpState::SynSent as u8 && (f & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK) && !is_outbound => {
+        (s, f)
+            if s == TcpState::SynSent as u8
+                && (f & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK)
+                && !is_outbound =>
+        {
             TcpState::SynReceived as u8
         }
         // ACK for SYN-ACK
@@ -943,7 +952,9 @@ fn update_conn_state(key: &NatBindingKey, tcp_flags: u8, is_outbound: bool) -> R
             TcpState::Established as u8
         }
         // FIN sent
-        (s, f) if s == TcpState::Established as u8 && (f & TCP_FIN) != 0 => TcpState::FinWait1 as u8,
+        (s, f) if s == TcpState::Established as u8 && (f & TCP_FIN) != 0 => {
+            TcpState::FinWait1 as u8
+        }
         // RST received - connection closed
         (_, f) if (f & TCP_RST) != 0 => TcpState::Closed as u8,
         // No change
@@ -960,7 +971,7 @@ fn update_conn_state(key: &NatBindingKey, tcp_flags: u8, is_outbound: bool) -> R
 /// Update UDP connection state (simpler - just timestamp)
 #[inline(always)]
 fn update_conn_state_udp(key: &NatBindingKey) -> Result<(), ()> {
-    if let Some(state) = unsafe { CONN_TRACK.get_ptr_mut(key) } {
+    if let Some(state) = CONN_TRACK.get_ptr_mut(key) {
         unsafe {
             (*state).last_seen = bpf_ktime_get_ns();
             (*state).packets_out += 1;
@@ -1048,44 +1059,55 @@ fn update_l4_checksum_incremental(
 
     let new_check = !sum as u16;
     unsafe {
-        *check_ptr = if new_check == 0 && !is_tcp { 0xFFFF } else { new_check };
+        *check_ptr = if new_check == 0 && !is_tcp {
+            0xFFFF
+        } else {
+            new_check
+        };
     }
 
     Ok(())
 }
 
-/// Full TCP checksum recalculation (needed for hairpin where both src and dst change)
+/// Incremental TCP checksum update for hairpin where both src and dst change
+/// Uses RFC 1624 approach for multiple field changes
 #[inline(always)]
-fn update_tcp_checksum_full(
-    ctx: &XdpContext,
-    ipv4hdr: *mut Ipv4Hdr,
+#[allow(clippy::too_many_arguments)]
+fn update_tcp_checksum_hairpin(
     tcphdr: *mut TcpHdr,
+    old_src_addr: u32,
+    new_src_addr: u32,
+    old_dst_addr: u32,
+    new_dst_addr: u32,
+    old_src_port: u16,
+    new_src_port: u16,
+    old_dst_port: u16,
+    new_dst_port: u16,
 ) -> Result<(), ()> {
-    // For now, use incremental update approach
-    // Full recalculation requires reading entire TCP segment which is complex in eBPF
-    // Most hardware supports checksum offload anyway
-    unsafe {
-        (*tcphdr).check = 0;
-    }
+    let old_check = unsafe { (*tcphdr).check };
 
-    let src_addr = unsafe { (*ipv4hdr).src_addr };
-    let dst_addr = unsafe { (*ipv4hdr).dst_addr };
-    let tcp_len = u16::from_be(unsafe { (*ipv4hdr).tot_len }) - Ipv4Hdr::LEN as u16;
+    // RFC 1624 incremental update for all changed fields
+    let mut sum = (!old_check) as u32;
 
-    // Pseudo header
-    let mut sum: u32 = 0;
-    sum += (src_addr >> 16) as u32;
-    sum += (src_addr & 0xFFFF) as u32;
-    sum += (dst_addr >> 16) as u32;
-    sum += (dst_addr & 0xFFFF) as u32;
-    sum += 6u32; // TCP protocol
-    sum += u16::to_be(tcp_len) as u32;
+    // Subtract old values, add new values for src addr
+    sum += (!(old_src_addr >> 16) as u16) as u32;
+    sum += (!(old_src_addr & 0xFFFF) as u16) as u32;
+    sum += ((new_src_addr >> 16) as u16) as u32;
+    sum += ((new_src_addr & 0xFFFF) as u16) as u32;
 
-    // TCP header (fixed 20 bytes for now, ignoring options)
-    let tcp_words = tcphdr as *const u16;
-    for i in 0..10 {
-        sum += unsafe { *tcp_words.add(i) } as u32;
-    }
+    // Subtract old values, add new values for dst addr
+    sum += (!(old_dst_addr >> 16) as u16) as u32;
+    sum += (!(old_dst_addr & 0xFFFF) as u16) as u32;
+    sum += ((new_dst_addr >> 16) as u16) as u32;
+    sum += ((new_dst_addr & 0xFFFF) as u16) as u32;
+
+    // Subtract old values, add new values for src port
+    sum += (!old_src_port) as u32;
+    sum += new_src_port as u32;
+
+    // Subtract old values, add new values for dst port
+    sum += (!old_dst_port) as u32;
+    sum += new_dst_port as u32;
 
     // Fold
     sum = (sum & 0xFFFF) + (sum >> 16);
@@ -1098,24 +1120,74 @@ fn update_tcp_checksum_full(
     Ok(())
 }
 
-/// Update ICMP checksum
+/// Update ICMP checksum incrementally for ID change only
+/// This is used for echo request/reply where only the ID field changes
 #[inline(always)]
-fn update_icmp_checksum(ctx: &XdpContext, icmphdr: *mut IcmpHdr) -> Result<(), ()> {
-    // ICMP checksum covers the entire ICMP message
-    // For simplicity, recalculate over fixed header
+fn update_icmp_checksum_incremental(
+    icmphdr: *mut IcmpHdr,
+    old_id: u16,
+    new_id: u16,
+) -> Result<(), ()> {
+    let old_check = unsafe { (*icmphdr).checksum };
+
+    // RFC 1624 incremental update: ~new_check = ~old_check + ~old_value + new_value
+    let mut sum = (!old_check) as u32;
+    sum += (!old_id) as u32;
+    sum += new_id as u32;
+
+    // Fold
+    sum = (sum & 0xFFFF) + (sum >> 16);
+    sum = (sum & 0xFFFF) + (sum >> 16);
+
+    unsafe {
+        (*icmphdr).checksum = !sum as u16;
+    }
+
+    Ok(())
+}
+
+/// Update ICMP checksum for error messages (full recalculation with bounded payload)
+/// ICMP error messages contain: 8-byte header + IP header + 8 bytes of original L4
+#[inline(always)]
+fn update_icmp_checksum_error(ctx: &XdpContext, icmphdr: *mut IcmpHdr) -> Result<(), ()> {
+    // Calculate ICMP message length from IP total length
+    let ipv4hdr: *const Ipv4Hdr = ptr_at(ctx, EthHdr::LEN)?;
+    let ip_total = u16::from_be(unsafe { (*ipv4hdr).tot_len }) as usize;
+    let icmp_len = ip_total.saturating_sub(Ipv4Hdr::LEN);
+
+    // Cap at reasonable size for verifier (ICMP error = 8 + 20 + 8 = 36 bytes typical)
+    let icmp_len = if icmp_len > 64 { 64 } else { icmp_len };
+
     unsafe {
         (*icmphdr).checksum = 0;
     }
 
     let mut sum: u32 = 0;
-    let icmp_words = icmphdr as *const u16;
+    let icmp_bytes = icmphdr as *const u8;
+    let data_end = ctx.data_end();
 
-    // ICMP header is 8 bytes = 4 u16 words
-    sum += unsafe { *icmp_words.add(0) } as u32;
-    sum += unsafe { *icmp_words.add(1) } as u32;
-    sum += unsafe { *icmp_words.add(2) } as u32;
-    sum += unsafe { *icmp_words.add(3) } as u32;
+    // Process in 16-bit words with bounds checking
+    let mut i = 0usize;
+    while i + 1 < icmp_len {
+        let ptr = unsafe { icmp_bytes.add(i) } as usize;
+        if ptr + 2 > data_end {
+            break;
+        }
+        let word = unsafe { *(icmp_bytes.add(i) as *const u16) };
+        sum += word as u32;
+        i += 2;
+    }
 
+    // Handle odd byte
+    if i < icmp_len {
+        let ptr = unsafe { icmp_bytes.add(i) } as usize;
+        if ptr < data_end {
+            let byte = unsafe { *icmp_bytes.add(i) };
+            sum += (byte as u32) << 8;
+        }
+    }
+
+    // Fold
     sum = (sum & 0xFFFF) + (sum >> 16);
     sum = (sum & 0xFFFF) + (sum >> 16);
 
@@ -1139,11 +1211,18 @@ fn is_internal_addr(addr: u32, config: &NatConfig) -> bool {
 /// Redirect packet to internal interface
 #[inline(always)]
 fn redirect_to_internal(config: &NatConfig) -> Result<u32, ()> {
-    unsafe {
-        DEVMAP
-            .redirect(config.internal_ifindex, 0)
-            .map_err(|_| ())?;
-    }
+    DEVMAP
+        .redirect(config.internal_ifindex, 0)
+        .map_err(|_| ())?;
+    Ok(xdp_action::XDP_REDIRECT)
+}
+
+/// Redirect packet to external interface
+#[inline(always)]
+fn redirect_to_external(config: &NatConfig) -> Result<u32, ()> {
+    DEVMAP
+        .redirect(config.external_ifindex, 0)
+        .map_err(|_| ())?;
     Ok(xdp_action::XDP_REDIRECT)
 }
 
@@ -1157,7 +1236,7 @@ fn get_tcp_flags(tcphdr: *const TcpHdr) -> u8 {
 /// Update per-CPU statistics
 #[inline(always)]
 fn update_stats<F: FnOnce(&mut NatStats)>(f: F) {
-    if let Some(stats) = unsafe { STATS.get_ptr_mut(0) } {
+    if let Some(stats) = STATS.get_ptr_mut(0) {
         f(unsafe { &mut *stats });
     }
 }
