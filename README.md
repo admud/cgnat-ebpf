@@ -204,3 +204,109 @@ make run ARGS="-e eth0 -i eth1 -E 203.0.113.1 -I 10.0.0.0/8"
 ## License
 
 MIT OR Apache-2.0
+
+---
+
+## Research & Discussion Notes
+
+### Existing eBPF/XDP NAT Implementations
+
+| Project | Organization | Scale | Notes |
+|---------|--------------|-------|-------|
+| [Katran](https://github.com/facebookincubator/katran) | Meta/Facebook | Millions of connections | L4 load balancer with XDP, handles Facebook's traffic |
+| [Cilium](https://github.com/cilium/cilium) | Isovalent/Cisco | Kubernetes clusters | Full NAT in eBPF, replaces kube-proxy + iptables |
+| [einat-ebpf](https://github.com/EHfive/einat-ebpf) | Open source | Home/small ISP | Full Cone NAT, but has hairpinning limitations (uses TC hooks) |
+| [eBPF BNG](https://markgascoyne.co.uk/posts/ebpf-bng/) | Open source | ISP edge (OLT) | Includes NAT44/CGNAT module, proposed as future of ISP edge |
+
+### What ISPs Use Today
+
+Most production CGNAT deployments use:
+- **Dedicated appliances**: A10, F5, Juniper ($50K-$500K)
+- **DPDK-based solutions**: VPP, custom implementations (100+ Gbps)
+- **Kernel netfilter**: iptables/nftables with conntrack (simplest but slowest)
+
+### Performance Comparison
+
+| Approach | Packets/sec (per core) | Latency | Source |
+|----------|------------------------|---------|--------|
+| iptables/nftables | ~1-2M pps | ~10-50μs | Industry benchmarks |
+| **XDP** | **10-26M pps** | **<1μs** | [Cloudflare](https://blog.cloudflare.com/how-to-drop-10-million-packets/) |
+| DPDK | 20-40M pps | <1μs | Various |
+| Hardware appliance | Line rate | <1μs | Vendor specs |
+
+### Why XDP is Faster
+
+```
+Traditional iptables path:
+  NIC → Driver → sk_buff allocation → netfilter hooks → conntrack → NAT → routing → output
+
+XDP path:
+  NIC → Driver → XDP program (NAT here) → redirect/TX
+              ↑
+              No sk_buff, no conntrack, no routing stack
+```
+
+From [Cilium's documentation](https://docs.cilium.io/en/latest/reference-guides/bpf/index.html):
+> XDP hooks into a very early ingress path at the driver layer, where it operates with direct access to the packet's DMA buffer. This is effectively as low-level as it can get.
+
+### Cost Comparison
+
+| Solution | Cost | Throughput |
+|----------|------|------------|
+| A10 Thunder CGN | $100K-$500K | 100 Gbps |
+| Juniper MX CGNAT | $50K-$200K | 40 Gbps |
+| **Commodity server + XDP** | **$5K-$15K** | **40-100 Gbps** |
+
+### Our Implementation vs Production Requirements
+
+| Feature | This Project | Production-Ready |
+|---------|--------------|------------------|
+| Basic SNAT/DNAT | ✅ | ✅ |
+| Hairpinning (XDP_REDIRECT) | ✅ | ✅ |
+| Port allocation (eBPF atomic) | ✅ | ✅ |
+| Checksums (RFC 1624) | ✅ | ✅ |
+| ICMP translation (RFC 5508) | ✅ | ✅ |
+| Connection tracking | ✅ (basic) | Needs timeout/cleanup |
+| Logging (RFC 6888) | ❌ | Required for ISPs |
+| Port Block Allocation | ❌ | Reduces logging overhead |
+| Multiple external IPs | ❌ | Required at scale |
+| ALGs (FTP, SIP) | ❌ | Sometimes needed |
+| HA/Failover | ❌ | Critical for production |
+
+### Why Isn't Everyone Using eBPF/XDP for CGNAT?
+
+1. **Maturity**: DPDK and hardware appliances have 10+ years of production hardening
+2. **Features**: Full RFC compliance (logging, port block allocation, ALGs) is complex
+3. **Expertise**: eBPF development requires specialized skills
+4. **Support**: Vendors provide 24/7 support; open source doesn't
+
+### The Industry Trend
+
+From the [eBPF BNG article](https://markgascoyne.co.uk/posts/ebpf-bng/):
+> For edge deployment (10-40 Gbps per OLT), eBPF/XDP is simpler and sufficient... This is the future of ISP edge infrastructure.
+
+The industry is moving toward eBPF/XDP for:
+- **Edge/access networks**: Where cost matters more than peak performance
+- **Cloud-native**: Kubernetes, containers (Cilium dominates here)
+- **DDoS mitigation**: XDP's speed is unmatched for packet filtering
+
+### Key Research Sources
+
+- [Cloudflare - How to drop 10 million packets per second](https://blog.cloudflare.com/how-to-drop-10-million-packets/)
+- [Cilium BPF/XDP Reference Guide](https://docs.cilium.io/en/latest/reference-guides/bpf/index.html)
+- [einat-ebpf - eBPF Full Cone NAT](https://github.com/EHfive/einat-ebpf)
+- [eBPF BNG - Killing the ISP Appliance](https://markgascoyne.co.uk/posts/ebpf-bng/)
+- [iptables vs eBPF - Why Kubernetes is Moving On](https://medium.com/@sahilsheikh6897/iptables-vs-ebpf-why-kubernetes-networking-is-moving-on-769487bf1ee7)
+- [Tigera - eBPF: When and When Not to Use It](https://www.tigera.io/blog/ebpf-when-and-when-not-to-use-it/)
+
+---
+
+## Future Work
+
+- [ ] Binding expiration and cleanup (userspace timer + eBPF map iteration)
+- [ ] Multiple external IP address pool support
+- [ ] Port Block Allocation (PBA) per RFC 7422 to reduce logging
+- [ ] Logging infrastructure for compliance (RFC 6888)
+- [ ] Endpoint-Independent Mapping/Filtering mode configuration
+- [ ] Performance benchmarking suite
+- [ ] HA/failover with state synchronization
