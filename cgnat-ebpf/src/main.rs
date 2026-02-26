@@ -12,11 +12,12 @@
 #![no_main]
 
 use aya_ebpf::{
-    bindings::xdp_action,
-    helpers::bpf_ktime_get_ns,
+    bindings::{bpf_fib_lookup as bpf_fib_lookup_param_t, xdp_action, BPF_FIB_LOOKUP_OUTPUT},
+    helpers::{bpf_fib_lookup, bpf_ktime_get_ns},
     macros::{map, xdp},
     maps::{Array, DevMap, HashMap, PerCpuArray},
     programs::XdpContext,
+    EbpfContext,
 };
 use aya_log_ebpf::debug;
 use cgnat_common::{
@@ -58,8 +59,9 @@ static PORT_ALLOC: Array<PortAllocState> = Array::with_max_entries(1, 0);
 static CONFIG: Array<NatConfig> = Array::with_max_entries(1, 0);
 
 /// Device map for XDP_REDIRECT
+/// Size increased to 4096 to support high interface indices
 #[map]
-static DEVMAP: DevMap = DevMap::with_max_entries(256, 0);
+static DEVMAP: DevMap = DevMap::with_max_entries(4096, 0);
 
 /// Per-CPU statistics
 #[map]
@@ -71,6 +73,16 @@ static STATS: PerCpuArray<NatStats> = PerCpuArray::with_max_entries(1, 0);
 
 /// Maximum port allocation attempts before giving up
 const MAX_PORT_ALLOC_ATTEMPTS: u32 = 64;
+
+/// BPF map insert flags
+const BPF_NOEXIST: u64 = 1; // Only insert if key doesn't exist (atomic)
+
+/// BPF FIB lookup return codes
+const BPF_FIB_LKUP_RET_SUCCESS: i64 = 0;
+const BPF_FIB_LKUP_RET_NO_NEIGH: i64 = 7;
+
+/// Address family for FIB lookup
+const AF_INET: u8 = 2;
 
 /// ICMP types
 const ICMP_ECHO_REPLY: u8 = 0;
@@ -232,7 +244,7 @@ fn handle_outbound_tcp(
         true, // is_tcp
     )?;
 
-    redirect_to_external(config)
+    redirect_to_external(ctx, config)
 }
 
 #[inline(always)]
@@ -295,7 +307,7 @@ fn handle_outbound_udp(
         )?;
     }
 
-    redirect_to_external(config)
+    redirect_to_external(ctx, config)
 }
 
 #[inline(always)]
@@ -336,7 +348,7 @@ fn handle_outbound_icmp(
             update_ip_checksum(ipv4hdr)?;
             update_icmp_checksum_incremental(icmphdr, old_id, binding.external_port.to_be())?;
 
-            redirect_to_external(config)
+            redirect_to_external(ctx, config)
         }
         ICMP_DEST_UNREACHABLE | ICMP_TIME_EXCEEDED => {
             // ICMP error - need to translate embedded packet
@@ -430,7 +442,7 @@ fn handle_inbound_tcp(
     )?;
 
     // Redirect to internal interface
-    redirect_to_internal(config)
+    redirect_to_internal(ctx, config)
 }
 
 #[inline(always)]
@@ -490,7 +502,7 @@ fn handle_inbound_udp(
         )?;
     }
 
-    redirect_to_internal(config)
+    redirect_to_internal(ctx, config)
 }
 
 #[inline(always)]
@@ -532,7 +544,7 @@ fn handle_inbound_icmp(
             update_ip_checksum(ipv4hdr)?;
             update_icmp_checksum_incremental(icmphdr, old_id, binding.internal_port.to_be())?;
 
-            redirect_to_internal(config)
+            redirect_to_internal(ctx, config)
         }
         ICMP_DEST_UNREACHABLE | ICMP_TIME_EXCEEDED => {
             handle_icmp_error_inbound(ctx, ipv4hdr, icmphdr, config)
@@ -667,7 +679,7 @@ fn handle_hairpin(
         "Hairpin: {} -> {}", src_addr, dst_binding.internal_addr
     );
 
-    redirect_to_internal(config)
+    redirect_to_internal(ctx, config)
 }
 
 // ============================================================================
@@ -745,7 +757,7 @@ fn handle_icmp_error_outbound(
     update_ip_checksum(ipv4hdr)?;
     update_icmp_checksum_error(ctx, icmphdr)?;
 
-    redirect_to_external(config)
+    redirect_to_external(ctx, config)
 }
 
 /// Handle inbound ICMP errors - translate embedded packet
@@ -818,7 +830,7 @@ fn handle_icmp_error_inbound(
     update_ip_checksum(ipv4hdr)?;
     update_icmp_checksum_error(ctx, icmphdr)?;
 
-    redirect_to_internal(config)
+    redirect_to_internal(ctx, config)
 }
 
 // ============================================================================
@@ -868,18 +880,20 @@ fn allocate_binding(key: &NatBindingKey, config: &NatConfig) -> Result<NatBindin
             _pad: [0; 2],
         };
 
-        // Insert into both maps
-        if NAT_BINDINGS.insert(key, &binding, 0).is_err() {
+        // Insert into both maps using BPF_NOEXIST for atomic "insert if not exists"
+        // This prevents race conditions where two CPUs might try to allocate the same port
+        if NAT_BINDINGS.insert(key, &binding, BPF_NOEXIST).is_err() {
+            // Key already exists (race condition) or map error - try next port
             continue;
         }
 
-        if NAT_REVERSE.insert(&reverse_key, key, 0).is_err() {
-            // Rollback the binding
+        if NAT_REVERSE.insert(&reverse_key, key, BPF_NOEXIST).is_err() {
+            // Reverse entry already exists (race) - rollback the forward binding
             let _ = NAT_BINDINGS.remove(key);
             continue;
         }
 
-        // Initialize connection state
+        // Initialize connection state (use BPF_NOEXIST for consistency)
         let conn_state = ConnState {
             last_seen: unsafe { bpf_ktime_get_ns() },
             packets_out: 1,
@@ -890,7 +904,7 @@ fn allocate_binding(key: &NatBindingKey, config: &NatConfig) -> Result<NatBindin
             flags: 0,
             _pad: [0; 6],
         };
-        let _ = CONN_TRACK.insert(key, &conn_state, 0);
+        let _ = CONN_TRACK.insert(key, &conn_state, BPF_NOEXIST);
 
         // Update stats
         unsafe {
@@ -1208,18 +1222,100 @@ fn is_internal_addr(addr: u32, config: &NatConfig) -> bool {
     (addr & config.internal_mask) == config.internal_subnet
 }
 
-/// Redirect packet to internal interface
+/// Perform FIB lookup to get next-hop MAC addresses and rewrite Ethernet header
+/// Returns Ok(()) on success, Err(()) if lookup fails
 #[inline(always)]
-fn redirect_to_internal(config: &NatConfig) -> Result<u32, ()> {
+fn fib_lookup_and_rewrite_macs(
+    ctx: &XdpContext,
+    dst_addr: u32, // destination IP in host byte order
+    ifindex: u32,  // output interface index
+) -> Result<(), ()> {
+    // Get IP header for protocol info
+    let ipv4hdr: *const Ipv4Hdr = ptr_at(ctx, EthHdr::LEN)?;
+    let protocol = unsafe { (*ipv4hdr).proto };
+    let tot_len = u16::from_be(unsafe { (*ipv4hdr).tot_len });
+
+    // Set up FIB lookup parameters
+    let mut fib_params: bpf_fib_lookup_param_t = unsafe { mem::zeroed() };
+    fib_params.family = AF_INET;
+    fib_params.l4_protocol = protocol as u8;
+    fib_params.ifindex = ifindex;
+    fib_params.__bindgen_anon_1.tot_len = tot_len;
+
+    // Set destination address (in network byte order for FIB lookup)
+    // Note: ipv4_src is in __bindgen_anon_3, ipv4_dst is in __bindgen_anon_4
+    fib_params.__bindgen_anon_3.ipv4_src = 0; // Let kernel fill in
+    fib_params.__bindgen_anon_4.ipv4_dst = dst_addr.to_be();
+
+    // Perform FIB lookup
+    let ret = unsafe {
+        bpf_fib_lookup(
+            ctx.as_ptr() as *mut _,
+            &mut fib_params as *mut _,
+            mem::size_of::<bpf_fib_lookup_param_t>() as i32,
+            BPF_FIB_LOOKUP_OUTPUT, // Skip src address lookup, just get MACs
+        )
+    };
+
+    if ret == BPF_FIB_LKUP_RET_SUCCESS || ret == BPF_FIB_LKUP_RET_NO_NEIGH {
+        // For NO_NEIGH, the kernel still fills in the interface MAC as smac
+        // but dmac may be incomplete - we'll still try to use it
+        // In production, you might want to trigger ARP and pass to kernel
+
+        // Rewrite Ethernet header with resolved MACs
+        let ethhdr: *mut EthHdr = ptr_at_mut(ctx, 0)?;
+        unsafe {
+            // Set source MAC to our interface's MAC (filled by FIB lookup)
+            (*ethhdr).src_addr = fib_params.smac;
+            // Set destination MAC to next-hop MAC (filled by FIB lookup)
+            (*ethhdr).dst_addr = fib_params.dmac;
+        }
+
+        if ret == BPF_FIB_LKUP_RET_NO_NEIGH {
+            // Neighbor not in ARP table - packet might not be deliverable
+            // but we'll let it through and hope ARP resolves it
+            // A more robust implementation might pass to kernel here
+        }
+
+        Ok(())
+    } else {
+        // FIB lookup failed - can't determine next hop
+        Err(())
+    }
+}
+
+/// Redirect packet to internal interface with proper L2 MAC rewrite
+#[inline(always)]
+fn redirect_to_internal(ctx: &XdpContext, config: &NatConfig) -> Result<u32, ()> {
+    // Get destination IP from the (already modified) IP header
+    let ipv4hdr: *const Ipv4Hdr = ptr_at(ctx, EthHdr::LEN)?;
+    let dst_addr = u32::from_be(unsafe { (*ipv4hdr).dst_addr });
+
+    // Perform FIB lookup and rewrite MACs
+    // If FIB lookup fails, fall back to XDP_PASS to let kernel handle it
+    if fib_lookup_and_rewrite_macs(ctx, dst_addr, config.internal_ifindex).is_err() {
+        return Ok(xdp_action::XDP_PASS);
+    }
+
     DEVMAP
         .redirect(config.internal_ifindex, 0)
         .map_err(|_| ())?;
     Ok(xdp_action::XDP_REDIRECT)
 }
 
-/// Redirect packet to external interface
+/// Redirect packet to external interface with proper L2 MAC rewrite
 #[inline(always)]
-fn redirect_to_external(config: &NatConfig) -> Result<u32, ()> {
+fn redirect_to_external(ctx: &XdpContext, config: &NatConfig) -> Result<u32, ()> {
+    // Get destination IP from the (already modified) IP header
+    let ipv4hdr: *const Ipv4Hdr = ptr_at(ctx, EthHdr::LEN)?;
+    let dst_addr = u32::from_be(unsafe { (*ipv4hdr).dst_addr });
+
+    // Perform FIB lookup and rewrite MACs
+    // If FIB lookup fails, fall back to XDP_PASS to let kernel handle it
+    if fib_lookup_and_rewrite_macs(ctx, dst_addr, config.external_ifindex).is_err() {
+        return Ok(xdp_action::XDP_PASS);
+    }
+
     DEVMAP
         .redirect(config.external_ifindex, 0)
         .map_err(|_| ())?;

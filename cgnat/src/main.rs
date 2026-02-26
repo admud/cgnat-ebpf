@@ -115,6 +115,18 @@ async fn run_cgnat(
     // Parse internal subnet
     let (subnet_addr, subnet_mask) = parse_cidr(&internal_subnet)?;
 
+    // Validate port range
+    if port_min > port_max {
+        anyhow::bail!(
+            "Invalid port range: port_min ({}) must be <= port_max ({})",
+            port_min,
+            port_max
+        );
+    }
+    if port_min == 0 {
+        anyhow::bail!("Invalid port_min: must be > 0 (port 0 is reserved)");
+    }
+
     info!("Starting CGNAT");
     info!("  External interface: {}", external_iface);
     info!("  Internal interface: {}", internal_iface);
