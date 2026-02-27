@@ -346,8 +346,8 @@ fn unpin_maps() {
 /// 4. Batch delete from all three maps
 fn run_gc(bpf: &mut Ebpf) -> Result<()> {
     let now_ns = {
-        let ts = clock_gettime(ClockId::CLOCK_MONOTONIC)
-            .context("clock_gettime(CLOCK_MONOTONIC)")?;
+        let ts =
+            clock_gettime(ClockId::CLOCK_MONOTONIC).context("clock_gettime(CLOCK_MONOTONIC)")?;
         ts.tv_sec() as u64 * 1_000_000_000 + ts.tv_nsec() as u64
     };
 
