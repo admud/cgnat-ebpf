@@ -222,8 +222,10 @@ async fn run_cgnat(
     devmap.set(external_ifindex, external_ifindex, None, 0)?;
     devmap.set(internal_ifindex, internal_ifindex, None, 0)?;
 
-    // Pin maps for external inspection (bpftool, tests)
-    pin_maps(&mut bpf)?;
+    // Pin maps for external inspection (bpftool, tests) — best-effort
+    if let Err(e) = pin_maps(&mut bpf) {
+        warn!("Map pinning unavailable ({}), continuing without it", e);
+    }
 
     // Attach XDP program to both interfaces
     let program: &mut Xdp = bpf.program_mut("cgnat_xdp").unwrap().try_into()?;

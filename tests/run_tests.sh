@@ -49,9 +49,10 @@ check_env() {
     done
 }
 
-# Check if CGNAT is running
+# Check if CGNAT is running (pgrep -x matches exact binary name to avoid
+# matching the test script or pgrep itself)
 check_cgnat() {
-    if ! pgrep -f "cgnat run" > /dev/null; then
+    if ! pgrep -x cgnat > /dev/null; then
         echo "CGNAT not running. Start it with:"
         echo "  sudo ip netns exec $NS_CGNAT $PROJECT_DIR/target/release/cgnat run \\"
         echo "    -e veth_ext_a -i br_int -E $EXTERNAL_IP -I 10.0.0.0/24 --skb-mode"
@@ -147,11 +148,17 @@ test_inbound_tcp() {
 test_hairpin_tcp() {
     log_test "Hairpin TCP (internal -> external IP -> internal)..."
 
+    # bpftool is required to inject static map entries
+    if ! command -v bpftool > /dev/null 2>&1; then
+        log_test "Hairpin TCP SKIPPED (bpftool not installed)"
+        return 0
+    fi
+
     BPF_PIN_DIR="/sys/fs/bpf/cgnat"
 
     # Check that pinned maps exist (CGNAT must be running with map pinning)
     if [ ! -e "$BPF_PIN_DIR/NAT_BINDINGS" ] || [ ! -e "$BPF_PIN_DIR/NAT_REVERSE" ]; then
-        log_pass "Hairpin TCP (skipped - pinned maps not found, start CGNAT first)"
+        log_test "Hairpin TCP SKIPPED (pinned maps not found at $BPF_PIN_DIR)"
         return 0
     fi
 
@@ -249,21 +256,23 @@ test_multiple_connections() {
 test_connection_reuse() {
     log_test "Connection reuse (same binding)..."
 
-    # Start server
-    ip netns exec $NS_EXTERNAL timeout 10 nc -l -p 7777 > /tmp/cgnat_test_reuse &
+    # Start server (use -k to keep listening for multiple connections)
+    ip netns exec $NS_EXTERNAL timeout 10 sh -c \
+        'for i in 1 2 3; do nc -l -p 7777 >> /tmp/cgnat_test_reuse; done' &
     SERVER_PID=$!
     sleep 0.5
 
-    # Send multiple messages from same source
+    # Send messages sequentially from the same source port.
+    # Each connection must fully close before the next one reuses the port.
     for i in 1 2 3; do
-        echo "Message $i" | ip netns exec $NS_INTERNAL_1 nc -p 55555 -w 1 $EXTERNAL_GW 7777 &
-        sleep 0.2
+        echo "Message $i" | ip netns exec $NS_INTERNAL_1 nc -p 55555 -w 1 $EXTERNAL_GW 7777
+        sleep 0.5
     done
 
-    sleep 2
+    sleep 1
     kill $SERVER_PID 2>/dev/null || true
 
-    # Should see messages (may vary due to timing)
+    # Should see at least one message (port reuse via the same NAT binding)
     if [ -s /tmp/cgnat_test_reuse ]; then
         log_pass "Connection reuse works"
         rm -f /tmp/cgnat_test_reuse
@@ -316,9 +325,9 @@ run_all_tests() {
     check_root
     check_env
 
-    # Check if CGNAT is running
+    # Check if CGNAT is running (pgrep -x to avoid matching this script)
     CGNAT_RUNNING=false
-    if pgrep -f "cgnat run" > /dev/null; then
+    if pgrep -x cgnat > /dev/null; then
         CGNAT_RUNNING=true
         log_test "CGNAT detected - running full tests"
         wait_cgnat_ready
