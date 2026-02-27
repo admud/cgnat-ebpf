@@ -50,7 +50,15 @@ static NAT_REVERSE: HashMap<NatReverseKey, NatBindingKey> = HashMap::with_max_en
 #[map]
 static CONN_TRACK: HashMap<NatBindingKey, ConnState> = HashMap::with_max_entries(1 << 20, 0);
 
-/// Port allocation state (single entry, uses atomic operations)
+/// Port allocation state (single entry).
+///
+/// Uses `read_volatile`/`write_volatile` instead of true atomics because:
+/// - `next_port`: collisions from concurrent CPUs are benign — the retry
+///   loop in `allocate_binding` handles duplicates via BPF_NOEXIST.
+/// - `allocated_count`: approximate is fine for stats display; userspace GC
+///   periodically resets it to the true count.
+/// - `alloc_failures`/`alloc_success`: monotonic counters where a lost
+///   increment is acceptable for diagnostics.
 #[map]
 static PORT_ALLOC: Array<PortAllocState> = Array::with_max_entries(1, 0);
 
@@ -79,7 +87,6 @@ const BPF_NOEXIST: u64 = 1; // Only insert if key doesn't exist (atomic)
 
 /// BPF FIB lookup return codes
 const BPF_FIB_LKUP_RET_SUCCESS: i64 = 0;
-const BPF_FIB_LKUP_RET_NO_NEIGH: i64 = 7;
 
 /// Address family for FIB lookup
 const AF_INET: u8 = 2;
@@ -906,7 +913,8 @@ fn allocate_binding(key: &NatBindingKey, config: &NatConfig) -> Result<NatBindin
         };
         let _ = CONN_TRACK.insert(key, &conn_state, BPF_NOEXIST);
 
-        // Update stats
+        // Update stats (volatile, not atomic — see PORT_ALLOC comment above).
+        // Races here are benign: GC periodically corrects allocated_count.
         unsafe {
             let allocated = core::ptr::read_volatile(&(*port_state).allocated_count);
             core::ptr::write_volatile(&mut (*port_state).allocated_count, allocated + 1);
@@ -1257,11 +1265,7 @@ fn fib_lookup_and_rewrite_macs(
         )
     };
 
-    if ret == BPF_FIB_LKUP_RET_SUCCESS || ret == BPF_FIB_LKUP_RET_NO_NEIGH {
-        // For NO_NEIGH, the kernel still fills in the interface MAC as smac
-        // but dmac may be incomplete - we'll still try to use it
-        // In production, you might want to trigger ARP and pass to kernel
-
+    if ret == BPF_FIB_LKUP_RET_SUCCESS {
         // Rewrite Ethernet header with resolved MACs
         let ethhdr: *mut EthHdr = ptr_at_mut(ctx, 0)?;
         unsafe {
@@ -1271,15 +1275,12 @@ fn fib_lookup_and_rewrite_macs(
             (*ethhdr).dst_addr = fib_params.dmac;
         }
 
-        if ret == BPF_FIB_LKUP_RET_NO_NEIGH {
-            // Neighbor not in ARP table - packet might not be deliverable
-            // but we'll let it through and hope ARP resolves it
-            // A more robust implementation might pass to kernel here
-        }
-
         Ok(())
     } else {
-        // FIB lookup failed - can't determine next hop
+        // FIB lookup failed (ret={}) - fall back to kernel path.
+        // NO_NEIGH (7) means neighbor not in ARP table; kernel will resolve ARP
+        // and subsequent packets will use XDP once the entry is cached.
+        debug!(ctx, "FIB lookup failed: ret={}, dst={:i}", ret, dst_addr);
         Err(())
     }
 }

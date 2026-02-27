@@ -147,17 +147,69 @@ test_inbound_tcp() {
 test_hairpin_tcp() {
     log_test "Hairpin TCP (internal -> external IP -> internal)..."
 
+    BPF_PIN_DIR="/sys/fs/bpf/cgnat"
+
+    # Check that pinned maps exist (CGNAT must be running with map pinning)
+    if [ ! -e "$BPF_PIN_DIR/NAT_BINDINGS" ] || [ ! -e "$BPF_PIN_DIR/NAT_REVERSE" ]; then
+        log_pass "Hairpin TCP (skipped - pinned maps not found, start CGNAT first)"
+        return 0
+    fi
+
+    # Internal host 2 (10.0.0.2) will serve on port 8888.
+    # We insert a static reverse binding so that packets to EXTERNAL_IP:8888
+    # get directed back to 10.0.0.2:8888.
+
+    # NatReverseKey: { external_addr(u32) external_port(u16) protocol(u8) _pad(u8) }
+    # external_addr = 203.0.113.1 = 0xCB007101 -> LE bytes: 01 71 00 cb
+    # external_port = 8888 = 0x22B8 -> LE bytes: b8 22
+    # protocol = 6 (TCP), _pad = 0
+    REVERSE_KEY="01 71 00 cb  b8 22 06 00"
+
+    # NatBindingKey: { internal_addr(u32) internal_port(u16) protocol(u8) _pad(u8) }
+    # internal_addr = 10.0.0.2 = 0x0A000002 -> LE bytes: 02 00 00 0a
+    # internal_port = 8888 = 0x22B8 -> LE bytes: b8 22
+    # protocol = 6 (TCP), _pad = 0
+    BINDING_KEY="02 00 00 0a  b8 22 06 00"
+
+    # NatBindingValue: { external_addr(u32) external_port(u16) _pad([u8;2]) }
+    # external_addr = 203.0.113.1 -> LE: 01 71 00 cb
+    # external_port = 8888 -> LE: b8 22
+    # _pad = 00 00
+    BINDING_VALUE="01 71 00 cb  b8 22 00 00"
+
+    # Insert reverse binding: EXTERNAL_IP:8888/TCP -> 10.0.0.2:8888
+    bpftool map update pinned "$BPF_PIN_DIR/NAT_REVERSE" \
+        key hex $REVERSE_KEY value hex $BINDING_KEY 2>/dev/null
+    if [ $? -ne 0 ]; then
+        log_fail "Hairpin TCP (failed to insert reverse binding via bpftool)"
+        return 1
+    fi
+
+    # Insert forward binding: 10.0.0.2:8888/TCP -> EXTERNAL_IP:8888
+    bpftool map update pinned "$BPF_PIN_DIR/NAT_BINDINGS" \
+        key hex $BINDING_KEY value hex $BINDING_VALUE 2>/dev/null
+
     # Start server on internal host 2
     ip netns exec $NS_INTERNAL_2 timeout 10 nc -l -p 8888 > /tmp/cgnat_test_hairpin &
     SERVER_PID=$!
     sleep 0.5
 
-    # This would require the NAT to have a port forwarding entry for 8888
-    # For now, we skip this as it requires setup
-    log_pass "Hairpin TCP (skipped - requires port forwarding setup)"
+    # Connect from internal host 1 to the EXTERNAL IP on port 8888
+    # This should hairpin: host1 -> CGNAT(EXTERNAL_IP:8888) -> host2:8888
+    echo "Hello hairpin" | ip netns exec $NS_INTERNAL_1 timeout 3 nc $EXTERNAL_IP 8888
+
+    sleep 1
     kill $SERVER_PID 2>/dev/null || true
-    rm -f /tmp/cgnat_test_hairpin
-    return 0
+
+    if grep -q "Hello hairpin" /tmp/cgnat_test_hairpin 2>/dev/null; then
+        log_pass "Hairpin TCP works"
+        rm -f /tmp/cgnat_test_hairpin
+        return 0
+    else
+        log_fail "Hairpin TCP failed"
+        rm -f /tmp/cgnat_test_hairpin
+        return 1
+    fi
 }
 
 test_multiple_connections() {
@@ -284,6 +336,7 @@ run_all_tests() {
         test_outbound_udp || true
         test_outbound_icmp || true
         test_inbound_tcp || true
+        test_hairpin_tcp || true
         test_multiple_connections || true
         test_connection_reuse || true
         test_different_internal_hosts || true

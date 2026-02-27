@@ -5,18 +5,38 @@
 use anyhow::{Context, Result};
 use aya::{
     include_bytes_aligned,
-    maps::{Array, DevMap, PerCpuArray},
+    maps::{Array, DevMap, HashMap, PerCpuArray},
     programs::{Xdp, XdpFlags},
     Ebpf,
 };
 use aya_log::EbpfLogger;
-use cgnat_common::{NatConfig, NatStats, PortAllocState};
+use cgnat_common::{
+    ConnState, NatBindingKey, NatBindingValue, NatConfig, NatReverseKey, NatStats, PortAllocState,
+};
 use clap::{Parser, Subcommand};
 use log::{info, warn};
+use nix::time::{clock_gettime, ClockId};
 use std::net::Ipv4Addr;
+use std::path::Path;
 use std::time::Duration;
 use tokio::signal;
 use tokio::time::interval;
+
+/// Pin path for BPF maps (used by bpftool for debugging/testing)
+const BPF_PIN_DIR: &str = "/sys/fs/bpf/cgnat";
+
+/// Timeout constants (nanoseconds) matching bpf_ktime_get_ns() clock
+const UDP_TIMEOUT_NS: u64 = 300 * 1_000_000_000; // 5 minutes
+const TCP_ESTABLISHED_TIMEOUT_NS: u64 = 7200 * 1_000_000_000; // 2 hours
+const TCP_TRANSITORY_TIMEOUT_NS: u64 = 240 * 1_000_000_000; // 4 minutes
+
+/// TCP states from cgnat_common::TcpState
+const TCP_STATE_ESTABLISHED: u8 = 3;
+const TCP_STATE_CLOSED: u8 = 10;
+const TCP_STATE_TIME_WAIT: u8 = 9;
+
+/// Protocol numbers
+const IPPROTO_TCP: u8 = 6;
 
 #[derive(Debug, Parser)]
 #[command(name = "cgnat", about = "eBPF/XDP CGNAT implementation")]
@@ -57,6 +77,10 @@ enum Commands {
         #[arg(long, default_value = "5")]
         stats_interval: u64,
 
+        /// Run garbage collection every N seconds (default: 30)
+        #[arg(long, default_value = "30")]
+        gc_interval: u64,
+
         /// Use SKB mode instead of driver mode (more compatible but slower)
         #[arg(long)]
         skb_mode: bool,
@@ -79,6 +103,7 @@ async fn main() -> Result<()> {
             port_min,
             port_max,
             stats_interval,
+            gc_interval,
             skb_mode,
         } => {
             run_cgnat(
@@ -89,6 +114,7 @@ async fn main() -> Result<()> {
                 port_min,
                 port_max,
                 stats_interval,
+                gc_interval,
                 skb_mode,
             )
             .await
@@ -110,6 +136,7 @@ async fn run_cgnat(
     port_min: u16,
     port_max: u16,
     stats_interval: u64,
+    gc_interval: u64,
     skb_mode: bool,
 ) -> Result<()> {
     // Parse internal subnet
@@ -133,6 +160,7 @@ async fn run_cgnat(
     info!("  External address: {}", external_addr);
     info!("  Internal subnet: {}", internal_subnet);
     info!("  Port range: {}-{}", port_min, port_max);
+    info!("  GC interval: {}s", gc_interval);
 
     // Load eBPF program
     // Load eBPF bytecode (built separately in cgnat-ebpf crate)
@@ -194,6 +222,9 @@ async fn run_cgnat(
     devmap.set(external_ifindex, external_ifindex, None, 0)?;
     devmap.set(internal_ifindex, internal_ifindex, None, 0)?;
 
+    // Pin maps for external inspection (bpftool, tests)
+    pin_maps(&mut bpf)?;
+
     // Attach XDP program to both interfaces
     let program: &mut Xdp = bpf.program_mut("cgnat_xdp").unwrap().try_into()?;
     program.load()?;
@@ -239,8 +270,9 @@ async fn run_cgnat(
 
     info!("CGNAT running. Press Ctrl+C to exit.");
 
-    // Main loop with stats printing
+    // Main loop with stats printing and GC
     let mut stats_ticker = interval(Duration::from_secs(stats_interval.max(1)));
+    let mut gc_ticker = interval(Duration::from_secs(gc_interval.max(1)));
     let mut last_stats = NatStats::default();
 
     loop {
@@ -257,8 +289,144 @@ async fn run_cgnat(
                     }
                 }
             }
+            _ = gc_ticker.tick(), if gc_interval > 0 => {
+                if let Err(e) = run_gc(&mut bpf) {
+                    warn!("GC error: {:#}", e);
+                }
+            }
         }
     }
+
+    // Cleanup pinned maps
+    unpin_maps();
+
+    Ok(())
+}
+
+/// Pin NAT maps to /sys/fs/bpf/cgnat/ for external inspection
+fn pin_maps(bpf: &mut Ebpf) -> Result<()> {
+    let pin_dir = Path::new(BPF_PIN_DIR);
+    if !pin_dir.exists() {
+        std::fs::create_dir_all(pin_dir)
+            .with_context(|| format!("Failed to create pin dir: {}", BPF_PIN_DIR))?;
+    }
+
+    for name in &["NAT_BINDINGS", "NAT_REVERSE", "CONN_TRACK"] {
+        let pin_path = pin_dir.join(name);
+        // Remove stale pin if it exists
+        let _ = std::fs::remove_file(&pin_path);
+        if let Some(map) = bpf.map(name) {
+            map.pin(&pin_path)
+                .with_context(|| format!("Failed to pin map {} to {:?}", name, pin_path))?;
+            info!("Pinned map {} to {:?}", name, pin_path);
+        }
+    }
+
+    Ok(())
+}
+
+/// Remove pinned maps on shutdown
+fn unpin_maps() {
+    let pin_dir = Path::new(BPF_PIN_DIR);
+    for name in &["NAT_BINDINGS", "NAT_REVERSE", "CONN_TRACK"] {
+        let _ = std::fs::remove_file(pin_dir.join(name));
+    }
+    let _ = std::fs::remove_dir(pin_dir);
+    info!("Cleaned up pinned maps");
+}
+
+/// Run garbage collection: scan CONN_TRACK for expired bindings and remove them.
+///
+/// Uses a phased approach to avoid borrow checker issues:
+/// 1. Collect all keys and their conn state from CONN_TRACK
+/// 2. Determine which are expired
+/// 3. For expired entries, look up the binding value to reconstruct reverse keys
+/// 4. Batch delete from all three maps
+fn run_gc(bpf: &mut Ebpf) -> Result<()> {
+    let now_ns = {
+        let ts = clock_gettime(ClockId::CLOCK_MONOTONIC)
+            .context("clock_gettime(CLOCK_MONOTONIC)")?;
+        ts.tv_sec() as u64 * 1_000_000_000 + ts.tv_nsec() as u64
+    };
+
+    // Phase 1: Collect all CONN_TRACK keys and values
+    let conn_track: HashMap<_, NatBindingKey, ConnState> =
+        HashMap::try_from(bpf.map("CONN_TRACK").unwrap())?;
+
+    let mut expired_keys: Vec<NatBindingKey> = Vec::new();
+    let keys: Vec<NatBindingKey> = conn_track.keys().filter_map(|k| k.ok()).collect();
+
+    for key in &keys {
+        let state = match conn_track.get(key, 0) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let age_ns = now_ns.saturating_sub(state.last_seen);
+        let is_expired = if key.protocol == IPPROTO_TCP {
+            match state.tcp_state {
+                TCP_STATE_CLOSED | TCP_STATE_TIME_WAIT => true, // Immediate cleanup
+                TCP_STATE_ESTABLISHED => age_ns > TCP_ESTABLISHED_TIMEOUT_NS,
+                _ => age_ns > TCP_TRANSITORY_TIMEOUT_NS, // SYN_SENT, FIN_WAIT, etc.
+            }
+        } else {
+            age_ns > UDP_TIMEOUT_NS
+        };
+
+        if is_expired {
+            expired_keys.push(*key);
+        }
+    }
+
+    if expired_keys.is_empty() {
+        return Ok(());
+    }
+
+    // Phase 2: Look up binding values to reconstruct reverse keys
+    let nat_bindings: HashMap<_, NatBindingKey, NatBindingValue> =
+        HashMap::try_from(bpf.map("NAT_BINDINGS").unwrap())?;
+
+    let mut reverse_keys: Vec<NatReverseKey> = Vec::new();
+    for key in &expired_keys {
+        if let Ok(binding) = nat_bindings.get(key, 0) {
+            reverse_keys.push(NatReverseKey {
+                external_addr: binding.external_addr,
+                external_port: binding.external_port,
+                protocol: key.protocol,
+                _pad: 0,
+            });
+        }
+    }
+
+    // Phase 3: Batch delete from all three maps
+    let mut conn_track_mut: HashMap<_, NatBindingKey, ConnState> =
+        HashMap::try_from(bpf.map_mut("CONN_TRACK").unwrap())?;
+    for key in &expired_keys {
+        let _ = conn_track_mut.remove(key);
+    }
+
+    let mut nat_bindings_mut: HashMap<_, NatBindingKey, NatBindingValue> =
+        HashMap::try_from(bpf.map_mut("NAT_BINDINGS").unwrap())?;
+    for key in &expired_keys {
+        let _ = nat_bindings_mut.remove(key);
+    }
+
+    let mut nat_reverse_mut: HashMap<_, NatReverseKey, NatBindingKey> =
+        HashMap::try_from(bpf.map_mut("NAT_REVERSE").unwrap())?;
+    for key in &reverse_keys {
+        let _ = nat_reverse_mut.remove(key);
+    }
+
+    // Correct allocated_count in PORT_ALLOC
+    let removed = expired_keys.len() as u32;
+    let mut port_alloc: Array<_, PortAllocState> =
+        Array::try_from(bpf.map_mut("PORT_ALLOC").unwrap())?;
+    if let Ok(mut state) = port_alloc.get(&0, 0) {
+        state.allocated_count = state.allocated_count.saturating_sub(removed);
+        let _ = port_alloc.set(0, state, 0);
+    }
+
+    info!("GC: removed {} expired bindings", removed);
 
     Ok(())
 }
