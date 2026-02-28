@@ -187,3 +187,77 @@ sudo ip netns exec ns_internal_1 iperf3 -c 203.0.113.254
 ```
 
 Compare with and without CGNAT to measure overhead.
+
+## A/B Benchmark Harness
+
+Use the automated harness to compare:
+- `cgnat` (XDP)
+- `iptables` SNAT
+- `nftables` SNAT
+
+### Run benchmark
+
+```bash
+# Builds project and runs all modes
+make bench-compare
+
+# Or run script directly
+sudo ./tests/bench_compare.sh
+
+# Run selected modes only
+sudo ./tests/bench_compare.sh --modes cgnat,iptables
+```
+
+Environment overrides:
+
+```bash
+PING_COUNT=200
+PING_INTERVAL=0.01
+TCP_DURATION=8
+UDP_DURATION=8
+UDP_BW=0
+UDP_LEN=1200
+CONNECT_ATTEMPTS=2000
+CONNECT_TIMEOUT=0.20
+CONNECT_PORT=9090
+CONNECT_SERVER_DURATION=8
+BENCH_DISABLE_OFFLOADS=1
+```
+
+### What it measures
+
+- Correctness probe:
+  - SNAT/DNAT packet signature check via `tcpdump`
+  - Hairpin probe for `cgnat` using pinned map injection (when `bpftool` is available)
+- ICMP latency:
+  - packet loss, avg, p50, p95, p99
+- TCP throughput:
+  - `iperf3` Mbps + retransmits
+- UDP throughput:
+  - `iperf3` Mbps + loss + jitter
+- Short-flow rate:
+  - tiny TCP connect-per-second (CPS) workload
+- CPU:
+  - system CPU utilization delta per workload (`/proc/stat`)
+
+### Important interpretation notes
+
+- The harness runs on a veth/netns testbed. For `cgnat`, this uses `--skb-mode`
+  (generic XDP), not native driver XDP.
+- Generic XDP results are useful for regression tracking, but they are not a
+  substitute for physical NIC driver-mode benchmarking.
+- By default, the harness disables GRO/GSO/TSO/LRO in namespaces to reduce
+  SKB-mode artifacts (`bpf_fib_lookup` frag-needed fallbacks).
+
+### Outputs
+
+Results are written to:
+
+- `bench/results-<timestamp>.csv`
+- `bench/results-<timestamp>.json`
+
+The harness also prints a small leaderboard for:
+- TCP throughput
+- UDP throughput
+- ICMP p95 latency
+- TCP connect rate

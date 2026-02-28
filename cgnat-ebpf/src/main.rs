@@ -56,7 +56,7 @@ static CONN_TRACK: HashMap<NatBindingKey, ConnState> = HashMap::with_max_entries
 /// - `next_port`: collisions from concurrent CPUs are benign — the retry
 ///   loop in `allocate_binding` handles duplicates via BPF_NOEXIST.
 /// - `allocated_count`: approximate is fine for stats display; userspace GC
-///   periodically resets it to the true count.
+///   periodically decrements it, though the count can drift low over time.
 /// - `alloc_failures`/`alloc_success`: monotonic counters where a lost
 ///   increment is acceptable for diagnostics.
 #[map]

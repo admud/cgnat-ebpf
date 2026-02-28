@@ -139,11 +139,11 @@ pub struct NatConfig {
     pub port_min: u16,
     /// Maximum port for allocation
     pub port_max: u16,
-    /// UDP timeout in seconds
+    /// UDP timeout in seconds (reserved for future use — GC currently uses hardcoded constants)
     pub udp_timeout: u32,
-    /// TCP established timeout in seconds
+    /// TCP established timeout in seconds (reserved — see above)
     pub tcp_established_timeout: u32,
-    /// TCP transitory timeout in seconds
+    /// TCP transitory timeout in seconds (reserved — see above)
     pub tcp_transitory_timeout: u32,
 }
 

@@ -25,7 +25,9 @@ use tokio::time::interval;
 /// Pin path for BPF maps (used by bpftool for debugging/testing)
 const BPF_PIN_DIR: &str = "/sys/fs/bpf/cgnat";
 
-/// Timeout constants (nanoseconds) matching bpf_ktime_get_ns() clock
+/// Default timeout constants (nanoseconds) matching bpf_ktime_get_ns() clock.
+/// These mirror the defaults in NatConfig but are used directly by the GC
+/// since the eBPF program does not enforce timeouts itself.
 const UDP_TIMEOUT_NS: u64 = 300 * 1_000_000_000; // 5 minutes
 const TCP_ESTABLISHED_TIMEOUT_NS: u64 = 7200 * 1_000_000_000; // 2 hours
 const TCP_TRANSITORY_TIMEOUT_NS: u64 = 240 * 1_000_000_000; // 4 minutes

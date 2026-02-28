@@ -35,10 +35,12 @@ lint:
 # Format code
 fmt:
 	cargo fmt --all
+	cd cgnat-ebpf && cargo +nightly fmt
 
 # Check formatting
 fmt-check:
 	cargo fmt --all -- --check
+	cd cgnat-ebpf && cargo +nightly fmt -- --check
 
 # Install dependencies
 deps:
@@ -73,6 +75,16 @@ test-status:
 # Run integration tests (requires test environment and CGNAT running)
 test-integration:
 	sudo ./tests/run_tests.sh all
+
+# Run A/B performance benchmark (cgnat vs iptables vs nftables)
+bench-compare: build
+	sudo ./tests/bench_compare.sh
+
+# Run benchmark with custom mode list
+# Example: make bench-compare-modes MODES='cgnat,iptables'
+bench-compare-modes: build
+	@test -n "$(MODES)" || (echo "Usage: make bench-compare-modes MODES='cgnat,iptables'" && exit 1)
+	sudo ./tests/bench_compare.sh --modes '$(MODES)'
 
 # Run CGNAT in test environment
 test-run: build

@@ -234,6 +234,35 @@ Most production CGNAT deployments use:
 | DPDK | 20-40M pps | <1μs | Various |
 | Hardware appliance | Line rate | <1μs | Vendor specs |
 
+### Latest Benchmark Summary (February 28, 2026)
+
+`tests/bench_compare.sh` was run in `cgnat`, `iptables`, and `nftables` modes on the namespace/veth testbed
+with `--skb-mode` and offloads disabled (`BENCH_DISABLE_OFFLOADS=1`).
+
+3-run mean results:
+
+| Mode | TCP Throughput (Mbps) | UDP Throughput (Mbps) | TCP Connect Rate (cps) |
+|------|------------------------|------------------------|-------------------------|
+| cgnat | 2980.9 | 1229.5 | 12162.3 |
+| iptables | 2762.9 | 1140.4 | 10710.3 |
+| nftables | 2774.6 | 1141.2 | 12574.3 |
+
+Observed delta (mean):
+- cgnat TCP throughput vs iptables: `+7.9%`
+- cgnat TCP throughput vs nftables: `+7.4%`
+- cgnat UDP throughput vs iptables/nftables: `+~7.8%`
+
+Notes:
+- These numbers are useful for regression tracking and MVP signal.
+- This environment is generic XDP (`skb`) on a virtualized setup, not native driver XDP on physical NICs.
+- Do not present these as production line-rate claims until validated on target hardware.
+
+Reproduce:
+```bash
+sudo env PING_COUNT=20 TCP_DURATION=5 UDP_DURATION=5 CONNECT_ATTEMPTS=300 \
+  BENCH_DISABLE_OFFLOADS=1 ./tests/bench_compare.sh --modes cgnat,iptables,nftables
+```
+
 ### Why XDP is Faster
 
 ```
@@ -301,6 +330,66 @@ The industry is moving toward eBPF/XDP for:
 
 ---
 
+## Market Context & Fundraising Readiness
+
+### The Opportunity
+
+IPv4 exhaustion is complete — all five Regional Internet Registries have depleted their free pools. Over 17% of eyeball ASes and 90%+ of cellular ASes now rely on CGNAT ([Cloudflare 2024 research](https://blog.cloudflare.com/detecting-cgn-to-reduce-collateral-damage/)). There are ~16,870 ISPs worldwide, and CGNAT is a must-have, not a nice-to-have.
+
+**Cost arbitrage drives adoption:**
+
+| Approach | Cost per 10K subscribers |
+|----------|--------------------------|
+| Buy IPv4 addresses ($15–52/IP) | ~$250,000 |
+| Hardware CGNAT (A10 Thunder) | $63,000–$445,000 |
+| Software CGNAT on commodity x86 | ~$10,000–$25,000 |
+
+Software-defined CGNAT on commodity hardware represents a **10–25x cost reduction** vs. dedicated appliances.
+
+### eBPF/XDP is Investor-Validated
+
+| Company | Technology | Outcome |
+|---------|-----------|---------|
+| Isovalent (Cilium) | eBPF/XDP | Acquired by Cisco for ~$650M (32x ARR), raised $69M total |
+| Tigera (Calico) | eBPF dataplane | $43M raised, 8M+ nodes/day |
+| NFWare | VPP/DPDK vCGNAT | $3.9M raised, 100+ ISP customers |
+| Groundcover | eBPF observability | $60M raised through Series B |
+
+NFWare is the closest comp — they validated the software CGNAT market with $3.9M in funding and bootstrapped to 100+ ISP customers. Their approach uses VPP/DPDK (kernel bypass). Our eBPF/XDP approach stays in-kernel, which is architecturally simpler and aligns with the direction Cilium proved at scale.
+
+### Current PoC Status
+
+**What works (strong for seed stage):**
+- Full SNAT/DNAT/hairpin via pure XDP — no kernel routing hacks
+- Stateful TCP/UDP/ICMP connection tracking in eBPF maps
+- A/B benchmark suite proving parity or better vs. iptables/nftables on equal footing
+- RFC 5508 (ICMP), RFC 1624 (checksums) compliance
+
+**What's needed before raising:**
+1. **Bare-metal benchmarks on real NICs** (ConnectX-5 or E810) — the veth/SKB numbers (3 Gbps) are valid for regression testing but don't show XDP's true capability. On real hardware, expect 10–40 Gbps/server (matching a $63K appliance on a $5K server).
+2. **One ISP design partner or LOI** — every funded company in this space had a named customer at seed (NFWare had Telefonica, RtBrick had Deutsche Telekom, DriveNets had AT&T).
+
+**What can wait (build with funding):**
+- Multi-IP pools, Port Block Allocation, RFC 6888 logging, HA/failover
+- These are expected gaps at seed stage
+
+### Performance on Real Hardware (Projected)
+
+The veth/SKB benchmark environment uses generic XDP — the slowest execution mode. On real hardware with native XDP:
+
+| Config | Throughput | Source |
+|--------|-----------|--------|
+| This PoC (veth/SKB mode) | 3 Gbps | Measured |
+| XDP native, single core, ConnectX-5 | 8–10 Mpps (~30–40 Gbps) | [CoNEXT 2018 XDP paper](https://dl.acm.org/doi/10.1145/3281411.3281443) |
+| XDP redirect, multi-core | 80–100+ Mpps | [Mellanox mlx5 benchmarks](https://patchwork.ozlabs.org/patch/1017382/) |
+| NFWare vCGNAT (VPP, x86) | 231 Gbps | [Intel builder report](https://builders.intel.com/docs/networkbuilders/nfware-provides-high-performance-virtual-carrier-grade-nat.pdf) |
+
+XDP achieves ~80% of DPDK throughput while staying fully in-kernel — no dedicated cores, no kernel bypass, simpler operations model.
+
+### Target Raise
+
+Based on comps: **$2M–$4M pre-seed/seed** with bare-metal validation and one ISP pilot. Capital-efficient path modeled on NFWare ($3.9M total → 100+ customers).
+
 ## Future Work
 
 - [ ] Binding expiration and cleanup (userspace timer + eBPF map iteration)
@@ -308,5 +397,5 @@ The industry is moving toward eBPF/XDP for:
 - [ ] Port Block Allocation (PBA) per RFC 7422 to reduce logging
 - [ ] Logging infrastructure for compliance (RFC 6888)
 - [ ] Endpoint-Independent Mapping/Filtering mode configuration
-- [ ] Performance benchmarking suite
+- [x] Performance benchmarking suite (`tests/bench_compare.sh`)
 - [ ] HA/failover with state synchronization

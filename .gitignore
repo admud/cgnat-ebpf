@@ -1,7 +1,11 @@
 # Rust
 /target/
+/cgnat-ebpf/target/
 **/*.rs.bk
 Cargo.lock
+
+# Benchmark output
+/bench/
 
 # IDE
 .idea/
