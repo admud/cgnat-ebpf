@@ -390,8 +390,54 @@ XDP achieves ~80% of DPDK throughput while staying fully in-kernel — no dedica
 
 Based on comps: **$2M–$4M pre-seed/seed** with bare-metal validation and one ISP pilot. Capital-efficient path modeled on NFWare ($3.9M total → 100+ customers).
 
+## Next Steps: Bare-Metal Benchmarking
+
+The veth/SKB benchmarks prove correctness and relative advantage. To generate investor-ready numbers (10–40 Gbps), we need native XDP on real NICs.
+
+### Hardware Options
+
+**Cloud (cheapest, fastest to set up):**
+- **Hetzner dedicated** (~€40–60/month) — Intel X710 (i40e driver), full native XDP. Best value.
+- **AWS c5n.xlarge** (~$0.50–1.00/hr) — ENA driver supports XDP native mode. Two instances in same placement group.
+- **GCP c2-standard-8** — gVNIC supports XDP.
+
+**Bare metal (best numbers):**
+- Any machine with two physical NICs that support XDP native mode
+- Supported NICs: Intel i40e (X710), Intel ice (E810), Mellanox mlx5 (ConnectX-5/6)
+
+### Test Topology
+
+```
+Machine A (traffic gen)          Machine B (CGNAT)                Machine C (server)
+  10.0.0.1/24                      10.0.0.254 (internal)
+  iperf3 client  ──── NIC ──────── NIC1          NIC2 ──── NIC ──  203.0.113.254
+                                   203.0.113.1 (external)            iperf3 server
+```
+
+Or two machines with Machine B having two NICs (internal + external).
+
+### Run
+
+```bash
+# Native mode (no --skb-mode flag)
+sudo ./target/release/cgnat run \
+    -e eth1 -i eth0 -E 203.0.113.1 -I 10.0.0.0/24
+```
+
+### Target Numbers
+
+| Metric | Target | Would prove |
+|--------|--------|-------------|
+| TCP throughput (single core) | 10+ Gbps | Matches $63K A10 appliance |
+| TCP throughput (multi-core) | 30–40 Gbps | Matches $200K+ appliance |
+| Packets per second | 5+ Mpps | XDP advantage over iptables |
+| Retransmits | ~0 | No packet corruption |
+
+These numbers on a $5K server vs. a $63K appliance is the pitch slide.
+
 ## Future Work
 
+- [ ] Bare-metal benchmark on native XDP with real NICs
 - [ ] Binding expiration and cleanup (userspace timer + eBPF map iteration)
 - [ ] Multiple external IP address pool support
 - [ ] Port Block Allocation (PBA) per RFC 7422 to reduce logging
